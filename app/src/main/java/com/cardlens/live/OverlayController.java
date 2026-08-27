@@ -55,7 +55,7 @@ public final class OverlayController {
         price.setText("—");
         priceCaption.setText("WAITING FOR CARD");
         buyTarget.setText("");
-        status.setText("SUDDEN DEATH MODE");
+        status.setText("VISUAL + TEXT • SUDDEN DEATH");
         status.setTextColor(BLUE);
     }
 
@@ -89,31 +89,31 @@ public final class OverlayController {
         if (message == null) message = "";
         String key = extractKey(message);
 
-        if (message.startsWith("FAST LOOKUP")) {
+        if (message.startsWith("VISUAL MATCH") || message.startsWith("FAST LOOKUP")) {
             title.setText("Possible card");
-            subtitle.setText(key.isEmpty() ? "Reading card number" : "#" + key);
+            subtitle.setText(key.isEmpty() ? "Comparing the illustration" : "#" + key + " • checking artwork");
             price.setText("—");
-            priceCaption.setText("CHECKING MARKET");
+            priceCaption.setText("MATCHING ILLUSTRATION");
             buyTarget.setText("");
-            status.setText("VERIFYING");
+            status.setText("VISUAL VERIFY");
             status.setTextColor(YELLOW);
             return;
         }
 
         if (message.startsWith("CONFIRMED")) {
             title.setText("Card confirmed");
-            subtitle.setText(key.isEmpty() ? "Pricing in progress" : "#" + key);
+            subtitle.setText(key.isEmpty() ? "Illustration matched" : "#" + key + " • illustration matched");
             price.setText("—");
             priceCaption.setText("CHECKING MARKET");
             buyTarget.setText("");
-            status.setText("PRICING");
+            status.setText("ART + TEXT MATCH");
             status.setTextColor(BLUE);
             return;
         }
 
         if (message.startsWith("AMBIGUOUS")) {
             title.setText("Possible match");
-            subtitle.setText(key.isEmpty() ? "More than one card fits" : "#" + key + " • multiple matches");
+            subtitle.setText(key.isEmpty() ? "Artwork is not distinct enough yet" : "#" + key + " • visual match unclear");
             price.setText("—");
             priceCaption.setText("NO PRICE SHOWN");
             buyTarget.setText("HOLD CARD STEADY");
@@ -207,7 +207,7 @@ public final class OverlayController {
         buyTarget = label("", 15.5f, GREEN, true);
         root.addView(buyTarget, matchWrap());
 
-        status = label("SUDDEN DEATH MODE", 9.5f, BLUE, true);
+        status = label("VISUAL + TEXT • SUDDEN DEATH", 9.5f, BLUE, true);
         status.setPadding(0, dp(6), 0, 0);
         root.addView(status, matchWrap());
 
