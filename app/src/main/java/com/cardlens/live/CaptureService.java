@@ -276,7 +276,8 @@ public class CaptureService extends Service {
             pendingKey = key;
             pendingHits = 2;
             pendingLastSeenAt = now;
-            main.post(() -> overlay.showCard(cached));
+            MarketCard immediateCard = cached;
+            main.post(() -> overlay.showCard(immediateCard));
             return;
         }
 
