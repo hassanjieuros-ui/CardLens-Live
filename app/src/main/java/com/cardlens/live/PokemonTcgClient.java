@@ -1,6 +1,7 @@
 package com.cardlens.live;
 
 import android.net.Uri;
+import android.os.SystemClock;
 import android.util.Log;
 
 import org.json.JSONArray;
@@ -14,8 +15,10 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -24,37 +27,20 @@ import java.util.concurrent.TimeUnit;
 public final class PokemonTcgClient {
     private static final String TAG = "PokemonTcgClient";
     private static final String API = "https://api.pokemontcg.io/v2/cards";
-    private static final int MAX_VISUAL_CANDIDATES = 4;
+    private static final int MAX_VISUAL_CANDIDATES = 3;
+    private static final long SEARCH_CACHE_TTL_MS = 120000;
+    private static final long STALE_CACHE_FALLBACK_MS = 900000;
+
+    private static final Map<String, CachedSearch> searchCache =
+            new LinkedHashMap<String, CachedSearch>(48, .75f, true) {
+                @Override protected boolean removeEldestEntry(Map.Entry<String, CachedSearch> eldest) {
+                    return size() > 96;
+                }
+            };
 
     public MarketCard lookup(CardNumberParser.Candidate candidate, String ocrText,
                              VisualMatcher.LiveSignature liveSignature) throws Exception {
-        String q = "number:" + candidate.collectorNumber() + " set.printedTotal:" + candidate.printedTotal();
-        String url = API + "?q=" + Uri.encode(q) + "&pageSize=10" +
-                "&select=id,name,number,rarity,set,images,tcgplayer";
-
-        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
-        connection.setRequestMethod("GET");
-        connection.setConnectTimeout(1800);
-        connection.setReadTimeout(2400);
-        connection.setUseCaches(true);
-        connection.setRequestProperty("Accept", "application/json");
-        connection.setRequestProperty("Connection", "keep-alive");
-        if (!BuildConfig.POKEMON_TCG_API_KEY.trim().isEmpty()) {
-            connection.setRequestProperty("X-Api-Key", BuildConfig.POKEMON_TCG_API_KEY);
-        }
-
-        int code = connection.getResponseCode();
-        InputStream stream = code >= 200 && code < 300
-                ? connection.getInputStream()
-                : connection.getErrorStream();
-        String body = readAll(stream);
-        connection.disconnect();
-
-        if (code == 429) throw new IllegalStateException("Pokémon TCG API rate limit reached");
-        if (code < 200 || code >= 300) throw new IllegalStateException("Card API HTTP " + code);
-
-        JSONObject root = new JSONObject(body);
-        JSONArray data = root.optJSONArray("data");
+        JSONArray data = fetchCandidates(candidate);
         if (data == null || data.length() == 0) return null;
 
         String normalizedOcr = normalize(ocrText);
@@ -75,7 +61,7 @@ public final class PokemonTcgClient {
             matches.add(new ScoredCard(card, textScore));
         }
 
-        // OCR narrows the search space; artwork now does most of the actual disambiguation.
+        // Text narrows the candidate set; artwork is the dominant disambiguation signal.
         matches.sort(Comparator.comparingInt(ScoredCard::textScore).reversed());
         scoreArtwork(matches, liveSignature);
 
@@ -84,7 +70,6 @@ public final class PokemonTcgClient {
             if (match.visualScore() >= 0) {
                 match.setCombinedScore(match.visualScore() * .72 + textNorm * .28);
             } else {
-                // Missing visual evidence is allowed as a fallback, but receives much less weight.
                 match.setCombinedScore(textNorm * .28);
             }
         }
@@ -100,21 +85,16 @@ public final class PokemonTcgClient {
                     "Hybrid match %s visual=%.3f text=%.3f gap=%.3f",
                     candidate.key(), best.visualScore(), bestText, gap));
 
-            // Reject an OCR-generated candidate when the visible artwork disagrees strongly.
             if (best.visualScore() < .30 && bestText < .70) {
                 Log.i(TAG, "Artwork rejected OCR candidate for " + candidate.key());
                 return null;
             }
 
-            // With multiple possible cards, require a meaningful visual/text lead rather than
-            // letting the shared collector number decide the result.
             if (runner != null && gap < .045) {
                 Log.i(TAG, "Visually ambiguous match for " + candidate.key());
                 return null;
             }
         } else {
-            // Network/image failure fallback keeps the scanner usable, but preserves the old
-            // conservative ambiguity behavior when artwork cannot be checked.
             int runnerText = runner != null ? runner.textScore() : 0;
             if (runner != null && best.textScore() - runnerText < 2) {
                 Log.i(TAG, "Text-only ambiguous match for " + candidate.key());
@@ -135,9 +115,67 @@ public final class PokemonTcgClient {
         return toMarketCard(best.card(), confidence);
     }
 
-    // Compatibility overload for any non-live callers/tests.
     public MarketCard lookup(CardNumberParser.Candidate candidate, String ocrText) throws Exception {
         return lookup(candidate, ocrText, null);
+    }
+
+    private static JSONArray fetchCandidates(CardNumberParser.Candidate candidate) throws Exception {
+        String cacheKey = candidate.key();
+        long now = SystemClock.elapsedRealtime();
+        CachedSearch cached;
+        synchronized (searchCache) {
+            cached = searchCache.get(cacheKey);
+            if (cached != null && now - cached.savedAt < SEARCH_CACHE_TTL_MS) {
+                Log.d(TAG, "Candidate cache hit " + cacheKey);
+                return new JSONObject(cached.body).optJSONArray("data");
+            }
+        }
+
+        String q = "number:" + candidate.collectorNumber()
+                + " set.printedTotal:" + candidate.printedTotal();
+        String url = API + "?q=" + Uri.encode(q) + "&pageSize=10"
+                + "&select=id,name,number,rarity,set,images,tcgplayer";
+
+        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+        connection.setRequestMethod("GET");
+        connection.setConnectTimeout(1800);
+        connection.setReadTimeout(2400);
+        connection.setUseCaches(true);
+        connection.setRequestProperty("Accept", "application/json");
+        connection.setRequestProperty("Connection", "keep-alive");
+        if (!BuildConfig.POKEMON_TCG_API_KEY.trim().isEmpty()) {
+            connection.setRequestProperty("X-Api-Key", BuildConfig.POKEMON_TCG_API_KEY);
+        }
+
+        try {
+            int code = connection.getResponseCode();
+            InputStream stream = code >= 200 && code < 300
+                    ? connection.getInputStream()
+                    : connection.getErrorStream();
+            String body = readAll(stream);
+
+            if (code == 429) {
+                if (cached != null && now - cached.savedAt < STALE_CACHE_FALLBACK_MS) {
+                    Log.w(TAG, "Rate limited; using recent cached candidates for " + cacheKey);
+                    return new JSONObject(cached.body).optJSONArray("data");
+                }
+                throw new IllegalStateException("Pokémon TCG API rate limit reached");
+            }
+            if (code < 200 || code >= 300) {
+                if (cached != null && now - cached.savedAt < STALE_CACHE_FALLBACK_MS) {
+                    Log.w(TAG, "Card API " + code + "; using recent cache for " + cacheKey);
+                    return new JSONObject(cached.body).optJSONArray("data");
+                }
+                throw new IllegalStateException("Card API HTTP " + code);
+            }
+
+            synchronized (searchCache) {
+                searchCache.put(cacheKey, new CachedSearch(body, now));
+            }
+            return new JSONObject(body).optJSONArray("data");
+        } finally {
+            connection.disconnect();
+        }
     }
 
     private static void scoreArtwork(List<ScoredCard> matches,
@@ -163,7 +201,8 @@ public final class PokemonTcgClient {
 
             for (int i = 0; i < futures.size(); i++) {
                 try {
-                    matches.get(i).setVisualScore(futures.get(i).get(1750, TimeUnit.MILLISECONDS));
+                    matches.get(i).setVisualScore(
+                            futures.get(i).get(1600, TimeUnit.MILLISECONDS));
                 } catch (Exception e) {
                     futures.get(i).cancel(true);
                     matches.get(i).setVisualScore(-1);
@@ -229,7 +268,8 @@ public final class PokemonTcgClient {
     private static String readAll(InputStream stream) throws Exception {
         if (stream == null) return "";
         StringBuilder out = new StringBuilder();
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(stream, StandardCharsets.UTF_8))) {
             String line;
             while ((line = reader.readLine()) != null) out.append(line);
         }
@@ -242,6 +282,16 @@ public final class PokemonTcgClient {
                 .replaceAll("[^a-z0-9]+", " ")
                 .replaceAll("\\s+", " ")
                 .trim();
+    }
+
+    private static final class CachedSearch {
+        private final String body;
+        private final long savedAt;
+
+        CachedSearch(String body, long savedAt) {
+            this.body = body;
+            this.savedAt = savedAt;
+        }
     }
 
     private static final class ScoredCard {
