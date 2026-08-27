@@ -54,11 +54,16 @@ public class CaptureService extends Service {
     private static final String TAG = "CardLensCapture";
     private static final String CHANNEL = "cardlens_live";
     private static final int NOTIFICATION_ID = 42;
-    private static final long OCR_INTERVAL_MS = 800;
-    private static final long API_MIN_INTERVAL_MS = 1600;
+
+    // v0.2 speed tuning. A live auction needs sub-second feedback, not perfect document OCR.
+    private static final long OCR_INTERVAL_MS = 300;
+    private static final long STABILITY_WINDOW_MS = 1800;
+    private static final long API_MIN_INTERVAL_MS = 450;
+    private static final int CAPTURE_MAX_WIDTH = 900;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final AtomicBoolean ocrBusy = new AtomicBoolean(false);
+    private final AtomicBoolean lookupBusy = new AtomicBoolean(false);
     private final ExecutorService network = Executors.newSingleThreadExecutor();
     private final PokemonTcgClient client = new PokemonTcgClient();
     private final Map<String, MarketCard> cache = new LinkedHashMap<String, MarketCard>(32, .75f, true) {
@@ -76,6 +81,7 @@ public class CaptureService extends Service {
     private OverlayController overlay;
     private long lastOcrAt;
     private long lastApiAt;
+    private long pendingLastSeenAt;
     private String pendingKey = "";
     private int pendingHits;
     private String shownKey = "";
@@ -144,7 +150,7 @@ public class CaptureService extends Service {
         DisplayMetrics dm = getResources().getDisplayMetrics();
         int sourceWidth = Math.max(dm.widthPixels, 720);
         int sourceHeight = Math.max(dm.heightPixels, 1280);
-        int width = Math.min(1080, sourceWidth);
+        int width = Math.min(CAPTURE_MAX_WIDTH, sourceWidth);
         int height = Math.max(1, Math.round(sourceHeight * (width / (float) sourceWidth)));
 
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2);
@@ -173,9 +179,9 @@ public class CaptureService extends Service {
             return;
         }
 
-        Bitmap bitmap;
+        Bitmap fullFrame;
         try {
-            bitmap = imageToBitmap(image);
+            fullFrame = imageToBitmap(image);
         } catch (Throwable t) {
             Log.w(TAG, "Local frame conversion failed", t);
             image.close();
@@ -184,13 +190,26 @@ public class CaptureService extends Service {
         }
         image.close();
 
-        recognizer.process(InputImage.fromBitmap(bitmap, 0))
+        Bitmap ocrFrame = cropToAuctionVideo(fullFrame);
+        if (ocrFrame != fullFrame) fullFrame.recycle();
+
+        recognizer.process(InputImage.fromBitmap(ocrFrame, 0))
                 .addOnSuccessListener(result -> processOcrText(result.getText()))
                 .addOnFailureListener(e -> Log.w(TAG, "On-device OCR failed", e))
                 .addOnCompleteListener(task -> {
-                    bitmap.recycle();
+                    ocrFrame.recycle();
                     ocrBusy.set(false);
                 });
+    }
+
+    private Bitmap cropToAuctionVideo(Bitmap bitmap) {
+        // Whatnot's bottom controls contain lots of unrelated text. Ignore the lowest 18% and
+        // a thin status-bar strip while keeping essentially the entire video/card area.
+        int top = Math.max(0, Math.round(bitmap.getHeight() * 0.035f));
+        int bottom = Math.min(bitmap.getHeight(), Math.round(bitmap.getHeight() * 0.82f));
+        int height = bottom - top;
+        if (height < bitmap.getHeight() / 2) return bitmap;
+        return Bitmap.createBitmap(bitmap, 0, top, bitmap.getWidth(), height);
     }
 
     private Bitmap imageToBitmap(Image image) {
@@ -209,34 +228,53 @@ public class CaptureService extends Service {
     }
 
     private void processOcrText(String text) {
+        final long now = SystemClock.elapsedRealtime();
         Optional<CardNumberParser.Candidate> parsed = CardNumberParser.parse(text);
+
         if (parsed.isEmpty()) {
-            pendingKey = "";
-            pendingHits = 0;
+            // Do not throw away a good read because one moving/video frame was blurry.
+            if (now - pendingLastSeenAt > STABILITY_WINDOW_MS) {
+                pendingKey = "";
+                pendingHits = 0;
+            }
             return;
         }
 
         CardNumberParser.Candidate candidate = parsed.get();
-        if (candidate.key().equals(pendingKey)) pendingHits++;
-        else {
-            pendingKey = candidate.key();
-            pendingHits = 1;
-        }
 
-        if (pendingHits < 2 || candidate.key().equals(shownKey)) return;
-
+        // Previously resolved cards can be shown from one OCR hit with zero network latency.
         MarketCard cached;
         synchronized (cache) { cached = cache.get(candidate.key()); }
-        if (cached != null) {
+        if (cached != null && !candidate.key().equals(shownKey)) {
             shownKey = candidate.key();
+            pendingKey = candidate.key();
+            pendingHits = 2;
+            pendingLastSeenAt = now;
             main.post(() -> overlay.showCard(cached));
             return;
         }
 
-        long now = SystemClock.elapsedRealtime();
+        if (candidate.key().equals(pendingKey) && now - pendingLastSeenAt <= STABILITY_WINDOW_MS) {
+            pendingHits++;
+        } else {
+            pendingKey = candidate.key();
+            pendingHits = 1;
+        }
+        pendingLastSeenAt = now;
+
+        if (pendingHits == 1) {
+            main.post(() -> overlay.showMessage("SAW #" + candidate.key() + " — CONFIRMING"));
+            return;
+        }
+        if (candidate.key().equals(shownKey)) return;
+        if (lookupBusy.get()) return;
+
         if (now - lastApiAt < API_MIN_INTERVAL_MS) return;
+        if (!lookupBusy.compareAndSet(false, true)) return;
+
         lastApiAt = now;
         String ocrSnapshot = text;
+        main.post(() -> overlay.showMessage("IDENTIFYING #" + candidate.key()));
         network.submit(() -> lookupCard(candidate, ocrSnapshot));
     }
 
@@ -244,7 +282,7 @@ public class CaptureService extends Service {
         try {
             MarketCard card = client.lookup(candidate, ocrText);
             if (card == null) {
-                main.post(() -> overlay.showMessage("AMBIGUOUS " + candidate.key() + " — HOLD"));
+                main.post(() -> overlay.showMessage("AMBIGUOUS " + candidate.key() + " — HOLD CARD STEADY"));
                 return;
             }
             synchronized (cache) { cache.put(candidate.key(), card); }
@@ -253,6 +291,8 @@ public class CaptureService extends Service {
         } catch (Exception e) {
             Log.w(TAG, "Card lookup failed", e);
             main.post(() -> overlay.showMessage("LOOKUP RETRYING"));
+        } finally {
+            lookupBusy.set(false);
         }
     }
 
