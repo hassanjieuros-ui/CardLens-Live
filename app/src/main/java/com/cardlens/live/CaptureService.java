@@ -44,8 +44,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  * User-consented screen-share service for CardLens Live.
  *
  * Android itself presents the MediaProjection permission dialog before this service can start.
- * Frames are processed only in memory for on-device OCR, are never saved, and raw screen images
- * are never transmitted. Only parsed trading-card identifiers are sent to the public card API.
+ * Frames are processed only in memory for on-device OCR/visual signatures, are never saved, and
+ * raw screen images are never transmitted. Only parsed trading-card identifiers are sent to the
+ * public card API; official candidate card images are downloaded for local illustration matching.
  */
 public class CaptureService extends Service {
     public static final String ACTION_START = "com.cardlens.live.START";
@@ -57,7 +58,7 @@ public class CaptureService extends Service {
     private static final String CHANNEL = "cardlens_live";
     private static final int NOTIFICATION_ID = 42;
 
-    // v0.3 sudden-death mode: optimize for a useful answer inside a five-second auction.
+    // Sudden-death mode: optimize for a useful answer inside a five-second auction.
     private static final long OCR_INTERVAL_MS = 120;
     private static final long STABILITY_WINDOW_MS = 1100;
     private static final long LOOKUP_DEDUP_MS = 4000;
@@ -199,12 +200,15 @@ public class CaptureService extends Service {
         Bitmap ocrFrame = cropForFastOcr(fullFrame);
         if (ocrFrame != fullFrame) fullFrame.recycle();
 
+        // Build an on-device visual fingerprint while the bitmap is alive. The fingerprint is
+        // tiny and immutable, so the raw captured frame can still be recycled immediately.
+        final VisualMatcher.LiveSignature visualSignature = VisualMatcher.fromLiveFrame(ocrFrame);
         final long ocrStartedAt = SystemClock.elapsedRealtime();
         recognizer.process(InputImage.fromBitmap(ocrFrame, 0))
                 .addOnSuccessListener(result -> {
                     long elapsed = SystemClock.elapsedRealtime() - ocrStartedAt;
                     Log.d(TAG, "OCR " + elapsed + "ms");
-                    processOcrText(result.getText());
+                    processOcrText(result.getText(), visualSignature);
                 })
                 .addOnFailureListener(e -> Log.w(TAG, "On-device OCR failed", e))
                 .addOnCompleteListener(task -> {
@@ -253,7 +257,7 @@ public class CaptureService extends Service {
         return cropped;
     }
 
-    private void processOcrText(String text) {
+    private void processOcrText(String text, VisualMatcher.LiveSignature visualSignature) {
         final long now = SystemClock.elapsedRealtime();
         Optional<CardNumberParser.Candidate> parsed = CardNumberParser.parse(text);
 
@@ -269,18 +273,6 @@ public class CaptureService extends Service {
         CardNumberParser.Candidate candidate = parsed.get();
         String key = candidate.key();
 
-        // Already-resolved cards are instant from the in-memory session cache.
-        MarketCard cached = getCached(key);
-        if (cached != null && !key.equals(shownKey)) {
-            shownKey = key;
-            pendingKey = key;
-            pendingHits = 2;
-            pendingLastSeenAt = now;
-            MarketCard immediateCard = cached;
-            main.post(() -> overlay.showCard(immediateCard));
-            return;
-        }
-
         if (key.equals(pendingKey) && now - pendingLastSeenAt <= STABILITY_WINDOW_MS) {
             pendingHits++;
         } else {
@@ -289,25 +281,25 @@ public class CaptureService extends Service {
         }
         pendingLastSeenAt = now;
 
-        // Critical v0.3 change: start pricing on the FIRST plausible OCR hit. Verification and
-        // network lookup now happen in parallel instead of serially.
-        maybeStartLookup(candidate, text);
+        // Start candidate retrieval on the first plausible OCR hit, but pass the current visual
+        // fingerprint so illustration similarity—not the shared collector number—drives the final
+        // candidate selection.
+        maybeStartLookup(candidate, text, visualSignature);
 
         if (pendingHits == 1) {
-            main.post(() -> overlay.showMessage("FAST LOOKUP #" + key + " — VERIFYING"));
+            main.post(() -> overlay.showMessage("VISUAL MATCH #" + key + " — VERIFYING"));
             return;
         }
 
         if (key.equals(shownKey)) return;
 
-        // The speculative lookup may already have completed while OCR was confirming the card.
-        cached = getCached(key);
+        // The speculative hybrid lookup may already have completed while OCR was confirming.
+        MarketCard cached = getCached(key);
         if (cached != null) {
             shownKey = key;
-            MarketCard finalCached = cached;
-            main.post(() -> overlay.showCard(finalCached));
+            main.post(() -> overlay.showCard(cached));
         } else {
-            main.post(() -> overlay.showMessage("CONFIRMED #" + key + " — PRICING"));
+            main.post(() -> overlay.showMessage("CONFIRMED #" + key + " — VISUAL PRICING"));
         }
     }
 
@@ -317,9 +309,9 @@ public class CaptureService extends Service {
         }
     }
 
-    private void maybeStartLookup(CardNumberParser.Candidate candidate, String ocrText) {
+    private void maybeStartLookup(CardNumberParser.Candidate candidate, String ocrText,
+                                  VisualMatcher.LiveSignature visualSignature) {
         String key = candidate.key();
-        if (getCached(key) != null) return;
 
         long now = SystemClock.elapsedRealtime();
         Long previous = lookupStartedAt.get(key);
@@ -335,20 +327,20 @@ public class CaptureService extends Service {
         }
 
         String ocrSnapshot = ocrText;
-        network.submit(() -> lookupCard(candidate, ocrSnapshot));
+        network.submit(() -> lookupCard(candidate, ocrSnapshot, visualSignature));
     }
 
-    private void lookupCard(CardNumberParser.Candidate candidate, String ocrText) {
+    private void lookupCard(CardNumberParser.Candidate candidate, String ocrText,
+                            VisualMatcher.LiveSignature visualSignature) {
         String key = candidate.key();
         long started = SystemClock.elapsedRealtime();
         try {
-            MarketCard card = client.lookup(candidate, ocrText);
+            MarketCard card = client.lookup(candidate, ocrText, visualSignature);
             long elapsed = SystemClock.elapsedRealtime() - started;
-            Log.d(TAG, "Lookup " + key + " " + elapsed + "ms");
+            Log.d(TAG, "Hybrid lookup " + key + " " + elapsed + "ms");
 
             if (card == null) {
-                // A speculative first-frame lookup can be ambiguous because OCR had little name
-                // context. Let a later confirmed frame retry immediately with better text.
+                // A weak illustration/text combination should never produce a confident price.
                 lookupStartedAt.remove(key);
                 if (key.equals(pendingKey) && pendingHits >= 2) {
                     main.post(() -> overlay.showMessage("AMBIGUOUS #" + key + " — HOLD STEADY"));
@@ -387,7 +379,7 @@ public class CaptureService extends Service {
         return new Notification.Builder(this, CHANNEL)
                 .setSmallIcon(R.drawable.ic_launcher)
                 .setContentTitle("CardLens Live")
-                .setContentText("User-approved sudden-death card scan is active")
+                .setContentText("Sudden-death illustration matching is active")
                 .setOngoing(true)
                 .setContentIntent(open)
                 .addAction(new Notification.Action.Builder(null, "Stop", stop).build())
