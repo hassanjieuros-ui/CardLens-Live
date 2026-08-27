@@ -23,14 +23,16 @@ public final class PokemonTcgClient {
 
     public MarketCard lookup(CardNumberParser.Candidate candidate, String ocrText) throws Exception {
         String q = "number:" + candidate.collectorNumber() + " set.printedTotal:" + candidate.printedTotal();
-        String url = API + "?q=" + Uri.encode(q) + "&pageSize=20" +
+        String url = API + "?q=" + Uri.encode(q) + "&pageSize=12" +
                 "&select=id,name,number,rarity,set,tcgplayer";
 
         HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
         connection.setRequestMethod("GET");
-        connection.setConnectTimeout(5000);
-        connection.setReadTimeout(5000);
+        connection.setConnectTimeout(3000);
+        connection.setReadTimeout(3500);
+        connection.setUseCaches(true);
         connection.setRequestProperty("Accept", "application/json");
+        connection.setRequestProperty("Accept-Encoding", "gzip");
         if (!BuildConfig.POKEMON_TCG_API_KEY.trim().isEmpty()) {
             connection.setRequestProperty("X-Api-Key", BuildConfig.POKEMON_TCG_API_KEY);
         }
@@ -70,7 +72,9 @@ public final class PokemonTcgClient {
         matches.sort(Comparator.comparingInt(ScoredCard::score).reversed());
         ScoredCard best = matches.get(0);
         int runnerUp = matches.size() > 1 ? matches.get(1).score() : 0;
-        double confidence = matches.size() == 1 ? 0.98 : Math.min(0.96, 0.62 + Math.max(0, best.score() - runnerUp) * 0.06);
+        double confidence = matches.size() == 1
+                ? 0.98
+                : Math.min(0.96, 0.62 + Math.max(0, best.score() - runnerUp) * 0.06);
 
         if (matches.size() > 1 && best.score() - runnerUp < 2) {
             Log.i(TAG, "Ambiguous match for " + candidate.key() + ": " + matches.size() + " candidates");
@@ -91,7 +95,7 @@ public final class PokemonTcgClient {
         if (tcg != null) {
             JSONObject prices = tcg.optJSONObject("prices");
             if (prices != null) {
-                var keys = prices.keys();
+                java.util.Iterator<String> keys = prices.keys();
                 while (keys.hasNext()) {
                     String finish = keys.next();
                     JSONObject p = prices.optJSONObject(finish);
