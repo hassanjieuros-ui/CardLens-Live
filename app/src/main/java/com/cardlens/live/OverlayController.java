@@ -55,7 +55,7 @@ public final class OverlayController {
         price.setText("—");
         priceCaption.setText("WAITING FOR CARD");
         buyTarget.setText("");
-        status.setText("VISUAL + TEXT • SUDDEN DEATH");
+        status.setText("HYBRID • SUDDEN DEATH");
         status.setTextColor(BLUE);
     }
 
@@ -89,24 +89,24 @@ public final class OverlayController {
         if (message == null) message = "";
         String key = extractKey(message);
 
-        if (message.startsWith("VISUAL MATCH") || message.startsWith("FAST LOOKUP")) {
+        if (message.startsWith("CANDIDATE")) {
             title.setText("Possible card");
-            subtitle.setText(key.isEmpty() ? "Comparing the illustration" : "#" + key + " • checking artwork");
+            subtitle.setText(key.isEmpty() ? "Confirming the read" : "#" + key + " • confirming");
             price.setText("—");
-            priceCaption.setText("MATCHING ILLUSTRATION");
+            priceCaption.setText("VERIFYING CARD");
             buyTarget.setText("");
-            status.setText("VISUAL VERIFY");
+            status.setText("QUICK CHECK");
             status.setTextColor(YELLOW);
             return;
         }
 
-        if (message.startsWith("CONFIRMED")) {
-            title.setText("Card confirmed");
-            subtitle.setText(key.isEmpty() ? "Illustration matched" : "#" + key + " • illustration matched");
+        if (message.startsWith("VISUAL MATCH") || message.startsWith("IDENTIFYING")) {
+            title.setText("Matching artwork");
+            subtitle.setText(key.isEmpty() ? "Comparing the illustration" : "#" + key + " • artwork check");
             price.setText("—");
-            priceCaption.setText("CHECKING MARKET");
+            priceCaption.setText("IDENTIFYING CARD");
             buyTarget.setText("");
-            status.setText("ART + TEXT MATCH");
+            status.setText("ARTWORK VERIFY");
             status.setTextColor(BLUE);
             return;
         }
@@ -122,13 +122,24 @@ public final class OverlayController {
             return;
         }
 
-        if (message.contains("RETRYING")) {
-            title.setText("Card detected");
-            subtitle.setText("Pricing source is taking longer");
+        if (message.contains("RATE LIMITED")) {
+            title.setText("Card data paused");
+            subtitle.setText("Too many card-data requests were reached");
             price.setText("—");
-            priceCaption.setText("MARKET PENDING");
-            buyTarget.setText("");
-            status.setText("RETRYING PRICE");
+            priceCaption.setText("IDENTITY NOT CONFIRMED");
+            buyTarget.setText("SCANNER WILL RETRY SAFELY");
+            status.setText("RATE LIMIT");
+            status.setTextColor(RED);
+            return;
+        }
+
+        if (message.contains("IDENTIFICATION RETRYING")) {
+            title.setText("Card not resolved");
+            subtitle.setText("Card-data connection is retrying");
+            price.setText("—");
+            priceCaption.setText("IDENTITY NOT CONFIRMED");
+            buyTarget.setText("KEEP CARD VISIBLE");
+            status.setText("RETRYING SAFELY");
             status.setTextColor(YELLOW);
             return;
         }
@@ -178,8 +189,8 @@ public final class OverlayController {
         header.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView brand = label("CARDLENS", 10.5f, TEXT, true);
-        header.addView(brand, new LinearLayout.LayoutParams(0,
-                LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        header.addView(brand, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
         TextView live = label("● LIVE", 10, GREEN, true);
         live.setGravity(Gravity.CENTER);
@@ -207,7 +218,7 @@ public final class OverlayController {
         buyTarget = label("", 15.5f, GREEN, true);
         root.addView(buyTarget, matchWrap());
 
-        status = label("VISUAL + TEXT • SUDDEN DEATH", 9.5f, BLUE, true);
+        status = label("HYBRID • SUDDEN DEATH", 9.5f, BLUE, true);
         status.setPadding(0, dp(6), 0, 0);
         root.addView(status, matchWrap());
 
@@ -269,8 +280,7 @@ public final class OverlayController {
         private float downX;
         private float downY;
 
-        @Override
-        public boolean onTouch(View v, MotionEvent event) {
+        @Override public boolean onTouch(View v, MotionEvent event) {
             switch (event.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
                     startX = params.x;
