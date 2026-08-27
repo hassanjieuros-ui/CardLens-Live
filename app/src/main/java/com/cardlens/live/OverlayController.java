@@ -3,6 +3,7 @@ package com.cardlens.live;
 import android.content.Context;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
+import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.provider.Settings;
 import android.view.Gravity;
@@ -15,14 +16,26 @@ import android.widget.TextView;
 import java.util.Locale;
 
 public final class OverlayController {
+    private static final int SURFACE = Color.rgb(18, 22, 27);
+    private static final int BORDER = Color.rgb(48, 56, 66);
+    private static final int TEXT = Color.WHITE;
+    private static final int SECONDARY = Color.rgb(178, 186, 197);
+    private static final int MUTED = Color.rgb(116, 126, 139);
+    private static final int BLUE = Color.rgb(87, 166, 255);
+    private static final int GREEN = Color.rgb(53, 208, 127);
+    private static final int YELLOW = Color.rgb(247, 201, 72);
+    private static final int RED = Color.rgb(255, 92, 92);
+
     private final Context context;
     private final WindowManager windowManager;
+
     private LinearLayout root;
     private WindowManager.LayoutParams params;
     private TextView title;
     private TextView subtitle;
-    private TextView market;
-    private TextView buys;
+    private TextView price;
+    private TextView priceCaption;
+    private TextView buyTarget;
     private TextView status;
 
     public OverlayController(Context context) {
@@ -37,83 +50,212 @@ public final class OverlayController {
     public void showScanning() {
         if (!canShow()) return;
         ensureCreated();
-        title.setText("CARDLENS LIVE");
-        subtitle.setText("Watching for a stable card number…");
-        market.setText("Whatnot live scan");
-        buys.setText("");
-        status.setText("ON-DEVICE OCR");
+        title.setText("Scanning…");
+        subtitle.setText("Watching the auction");
+        price.setText("—");
+        priceCaption.setText("WAITING FOR CARD");
+        buyTarget.setText("");
+        status.setText("SUDDEN DEATH MODE");
+        status.setTextColor(BLUE);
     }
 
     public void showCard(MarketCard card) {
         if (!canShow()) return;
         ensureCreated();
+
         title.setText(card.name());
-        subtitle.setText(card.setName() + "  •  #" + card.number() +
-                (card.rarity().trim().isEmpty() ? "" : "  •  " + card.rarity()));
-        market.setText(card.marketLabel());
-        buys.setText("80%  " + card.maxBidLabel(.80) + "     70%  " + card.maxBidLabel(.70));
-        String confidence = String.format(Locale.US, "MATCH %.0f%%", card.confidence() * 100);
-        if (!card.priceUpdatedAt().trim().isEmpty()) confidence += "  •  PRICE " + card.priceUpdatedAt();
+        subtitle.setText(card.setName() + "  •  #" + card.number());
+
+        if (card.hasPrice()) {
+            price.setText(marketValueLabel(card));
+            priceCaption.setText(card.priceVariants() > 1 ? "TCG MARKET RANGE" : "TCG MARKET");
+            buyTarget.setText("BUY ≤ " + card.maxBidLabel(.80));
+        } else {
+            price.setText("—");
+            priceCaption.setText("MARKET UNAVAILABLE");
+            buyTarget.setText("CARD IDENTIFIED");
+        }
+
+        String confidence = String.format(Locale.US, "%.0f%% MATCH", card.confidence() * 100);
+        if (card.hasPrice()) confidence += "  •  70% " + card.maxBidLabel(.70);
         status.setText(confidence);
+        status.setTextColor(card.confidence() >= .85 ? GREEN : YELLOW);
     }
 
     public void showMessage(String message) {
         if (!canShow()) return;
         ensureCreated();
+
+        if (message == null) message = "";
+        String key = extractKey(message);
+
+        if (message.startsWith("FAST LOOKUP")) {
+            title.setText("Possible card");
+            subtitle.setText(key.isEmpty() ? "Reading card number" : "#" + key);
+            price.setText("—");
+            priceCaption.setText("CHECKING MARKET");
+            buyTarget.setText("");
+            status.setText("VERIFYING");
+            status.setTextColor(YELLOW);
+            return;
+        }
+
+        if (message.startsWith("CONFIRMED")) {
+            title.setText("Card confirmed");
+            subtitle.setText(key.isEmpty() ? "Pricing in progress" : "#" + key);
+            price.setText("—");
+            priceCaption.setText("CHECKING MARKET");
+            buyTarget.setText("");
+            status.setText("PRICING");
+            status.setTextColor(BLUE);
+            return;
+        }
+
+        if (message.startsWith("AMBIGUOUS")) {
+            title.setText("Possible match");
+            subtitle.setText(key.isEmpty() ? "More than one card fits" : "#" + key + " • multiple matches");
+            price.setText("—");
+            priceCaption.setText("NO PRICE SHOWN");
+            buyTarget.setText("HOLD CARD STEADY");
+            status.setText("LOW CONFIDENCE");
+            status.setTextColor(YELLOW);
+            return;
+        }
+
+        if (message.contains("RETRYING")) {
+            title.setText("Card detected");
+            subtitle.setText("Pricing source is taking longer");
+            price.setText("—");
+            priceCaption.setText("MARKET PENDING");
+            buyTarget.setText("");
+            status.setText("RETRYING PRICE");
+            status.setTextColor(YELLOW);
+            return;
+        }
+
+        if (message.contains("SCREEN SHARE")) {
+            title.setText("Screen share unavailable");
+            subtitle.setText("Restart CardLens and approve sharing");
+            price.setText("—");
+            priceCaption.setText("SCANNER PAUSED");
+            buyTarget.setText("");
+            status.setText("ACTION NEEDED");
+            status.setTextColor(RED);
+            return;
+        }
+
         status.setText(message);
+        status.setTextColor(SECONDARY);
+    }
+
+    private String marketValueLabel(MarketCard card) {
+        if (!card.hasPrice()) return "—";
+        if (card.priceVariants() <= 1 || Math.abs(card.marketHigh() - card.marketLow()) < .01) {
+            return String.format(Locale.US, "$%.2f", card.marketHigh());
+        }
+        return String.format(Locale.US, "$%.0f–$%.0f", card.marketLow(), card.marketHigh());
+    }
+
+    private String extractKey(String message) {
+        int hash = message.indexOf('#');
+        if (hash < 0 || hash + 1 >= message.length()) return "";
+        String tail = message.substring(hash + 1).trim();
+        int space = tail.indexOf(' ');
+        if (space > 0) tail = tail.substring(0, space);
+        return tail.replace("—", "").trim();
     }
 
     private void ensureCreated() {
         if (root != null) return;
+
         root = new LinearLayout(context);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(14), dp(11), dp(14), dp(11));
+        root.setPadding(dp(14), dp(12), dp(14), dp(13));
+        root.setBackground(rounded(SURFACE, BORDER, 16));
 
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(Color.argb(235, 18, 18, 18));
-        bg.setCornerRadius(dp(14));
-        bg.setStroke(dp(1), Color.argb(110, 255, 255, 255));
-        root.setBackground(bg);
+        LinearLayout header = new LinearLayout(context);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
 
-        title = label(16, Color.WHITE, true);
-        subtitle = label(12, Color.rgb(210, 210, 210), false);
-        market = label(18, Color.WHITE, true);
-        buys = label(14, Color.rgb(235, 235, 235), true);
-        status = label(10, Color.rgb(175, 175, 175), false);
+        TextView brand = label("CARDLENS", 10.5f, TEXT, true);
+        header.addView(brand, new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
-        root.addView(title);
-        root.addView(subtitle);
-        root.addView(market);
-        root.addView(buys);
-        root.addView(status);
+        TextView live = label("● LIVE", 10, GREEN, true);
+        live.setGravity(Gravity.CENTER);
+        live.setPadding(dp(9), dp(4), dp(9), dp(4));
+        live.setBackground(rounded(Color.rgb(26, 49, 39), Color.rgb(44, 93, 68), 999));
+        header.addView(live);
+        root.addView(header, matchWrap());
+
+        title = label("Scanning…", 18, TEXT, true);
+        title.setPadding(0, dp(9), 0, 0);
+        root.addView(title, matchWrap());
+
+        subtitle = label("Watching the auction", 11.5f, SECONDARY, false);
+        subtitle.setPadding(0, dp(1), 0, 0);
+        root.addView(subtitle, matchWrap());
+
+        price = label("—", 31, TEXT, true);
+        price.setPadding(0, dp(8), 0, 0);
+        root.addView(price, matchWrap());
+
+        priceCaption = label("WAITING FOR CARD", 9.5f, MUTED, true);
+        priceCaption.setPadding(0, 0, 0, dp(6));
+        root.addView(priceCaption, matchWrap());
+
+        buyTarget = label("", 15.5f, GREEN, true);
+        root.addView(buyTarget, matchWrap());
+
+        status = label("SUDDEN DEATH MODE", 9.5f, BLUE, true);
+        status.setPadding(0, dp(6), 0, 0);
+        root.addView(status, matchWrap());
 
         params = new WindowManager.LayoutParams(
-                dp(320), WindowManager.LayoutParams.WRAP_CONTENT,
+                dp(300),
+                WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
                         WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                PixelFormat.TRANSLUCENT
-        );
+                PixelFormat.TRANSLUCENT);
         params.gravity = Gravity.TOP | Gravity.END;
         params.x = dp(10);
-        params.y = dp(110);
+        params.y = dp(95);
 
         root.setOnTouchListener(new DragTouchListener());
         windowManager.addView(root, params);
     }
 
-    private TextView label(float sp, int color, boolean bold) {
+    private TextView label(String value, float sp, int color, boolean bold) {
         TextView view = new TextView(context);
+        view.setText(value);
         view.setTextSize(sp);
         view.setTextColor(color);
-        view.setPadding(0, dp(2), 0, dp(2));
-        if (bold) view.setTypeface(view.getTypeface(), android.graphics.Typeface.BOLD);
+        view.setTypeface(Typeface.create("sans", bold ? Typeface.BOLD : Typeface.NORMAL));
+        view.setIncludeFontPadding(false);
         return view;
+    }
+
+    private GradientDrawable rounded(int fill, int stroke, int radiusDp) {
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(fill);
+        bg.setCornerRadius(dp(radiusDp));
+        bg.setStroke(dp(1), stroke);
+        return bg;
+    }
+
+    private LinearLayout.LayoutParams matchWrap() {
+        return new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
     }
 
     public void remove() {
         if (root == null) return;
-        try { windowManager.removeView(root); } catch (Exception ignored) {}
+        try {
+            windowManager.removeView(root);
+        } catch (Exception ignored) {
+        }
         root = null;
     }
 
@@ -122,8 +264,10 @@ public final class OverlayController {
     }
 
     private final class DragTouchListener implements View.OnTouchListener {
-        private int startX, startY;
-        private float downX, downY;
+        private int startX;
+        private int startY;
+        private float downX;
+        private float downY;
 
         @Override
         public boolean onTouch(View v, MotionEvent event) {
