@@ -32,7 +32,6 @@ public final class PokemonTcgClient {
         connection.setReadTimeout(3500);
         connection.setUseCaches(true);
         connection.setRequestProperty("Accept", "application/json");
-        connection.setRequestProperty("Accept-Encoding", "gzip");
         if (!BuildConfig.POKEMON_TCG_API_KEY.trim().isEmpty()) {
             connection.setRequestProperty("X-Api-Key", BuildConfig.POKEMON_TCG_API_KEY);
         }
