@@ -23,15 +23,16 @@ public final class PokemonTcgClient {
 
     public MarketCard lookup(CardNumberParser.Candidate candidate, String ocrText) throws Exception {
         String q = "number:" + candidate.collectorNumber() + " set.printedTotal:" + candidate.printedTotal();
-        String url = API + "?q=" + Uri.encode(q) + "&pageSize=12" +
+        String url = API + "?q=" + Uri.encode(q) + "&pageSize=10" +
                 "&select=id,name,number,rarity,set,tcgplayer";
 
         HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
         connection.setRequestMethod("GET");
-        connection.setConnectTimeout(3000);
-        connection.setReadTimeout(3500);
+        connection.setConnectTimeout(1800);
+        connection.setReadTimeout(2400);
         connection.setUseCaches(true);
         connection.setRequestProperty("Accept", "application/json");
+        connection.setRequestProperty("Connection", "keep-alive");
         if (!BuildConfig.POKEMON_TCG_API_KEY.trim().isEmpty()) {
             connection.setRequestProperty("X-Api-Key", BuildConfig.POKEMON_TCG_API_KEY);
         }
