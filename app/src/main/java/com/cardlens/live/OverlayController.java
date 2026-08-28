@@ -86,7 +86,6 @@ public final class OverlayController {
         if (!canShow()) return;
         ensureCreated();
         if (message == null) message = "";
-        String key = extractKey(message);
 
         if (message.startsWith("MOTION BUFFERING")) {
             setCompact(true);
@@ -101,9 +100,7 @@ public final class OverlayController {
         if (message.startsWith("CANDIDATE")) {
             setCompact(true);
             title.setText("Possible card");
-            subtitle.setText(key.isEmpty()
-                    ? "Combining nearby frames"
-                    : "#" + key + " • building a multi-frame read");
+            subtitle.setText("Building a multi-frame read");
             priceCaption.setText("COLLECTING CLEAR EVIDENCE");
             status.setText("TRACKING MOTION");
             status.setTextColor(YELLOW);
@@ -113,9 +110,7 @@ public final class OverlayController {
         if (message.startsWith("VISUAL MATCH") || message.startsWith("IDENTIFYING")) {
             setCompact(true);
             title.setText("Matching artwork");
-            subtitle.setText(key.isEmpty()
-                    ? "Using the clearest recent frame"
-                    : "#" + key + " • comparing best frame");
+            subtitle.setText("Using the clearest recent frame");
             priceCaption.setText("ILLUSTRATION + MULTI-FRAME TEXT");
             status.setText("BEST FRAME");
             status.setTextColor(BLUE);
@@ -125,9 +120,7 @@ public final class OverlayController {
         if (message.startsWith("AMBIGUOUS")) {
             setCompact(true);
             title.setText("Collecting more frames");
-            subtitle.setText(key.isEmpty()
-                    ? "The artwork is not clear enough yet"
-                    : "#" + key + " • waiting for a sharper angle");
+            subtitle.setText("The artwork is not clear enough yet");
             priceCaption.setText("NO PRICE SHOWN");
             status.setText("LOW CONFIDENCE");
             status.setTextColor(YELLOW);
@@ -181,15 +174,6 @@ public final class OverlayController {
             return String.format(Locale.US, "$%.2f", card.marketHigh());
         }
         return String.format(Locale.US, "$%.0f–$%.0f", card.marketLow(), card.marketHigh());
-    }
-
-    private String extractKey(String message) {
-        int hash = message.indexOf('#');
-        if (hash < 0 || hash + 1 >= message.length()) return "";
-        String tail = message.substring(hash + 1).trim();
-        int space = tail.indexOf(' ');
-        if (space > 0) tail = tail.substring(0, space);
-        return tail.replace("—", "").trim();
     }
 
     private void ensureCreated() {
