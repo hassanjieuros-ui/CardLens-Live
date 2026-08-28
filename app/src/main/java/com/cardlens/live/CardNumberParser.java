@@ -45,6 +45,12 @@ public final class CardNumberParser {
             if (number.matches("\\d+")) {
                 int numeric = Integer.parseInt(number);
                 if (numeric <= 0 || numeric > 999) continue;
+
+                // Secret rares can legitimately exceed a set's printed total, but OCR garbage such
+                // as 111/10 is far outside any useful ratio. Reject only extreme numeric outliers so
+                // normal secret-rare numbering like 148/142 or 205/165 still works.
+                if (numeric > total * 4 && numeric - total > 30) continue;
+                if (total < 15 && numeric > total + 25) continue;
             }
             return Optional.of(new Candidate(number, total));
         }
