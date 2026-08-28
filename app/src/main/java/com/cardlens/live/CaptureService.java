@@ -43,9 +43,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * User-consented screen-share service for CardLens Live.
  *
- * Frames are processed in memory only. Raw screen images are never saved or transmitted. OCR and
- * live illustration fingerprints are produced on-device; only parsed card identifiers are sent to
- * the card-data provider and official candidate images are downloaded for local comparison.
+ * Frames are processed in memory only. Raw screen images are never saved or transmitted. v0.7
+ * adds motion tolerance by rejecting heavily blurred frames, retaining only the clearest recent
+ * downscaled frame and fusing OCR evidence across a short rolling window.
  */
 public class CaptureService extends Service {
     public static final String ACTION_START = "com.cardlens.live.START";
@@ -57,12 +57,17 @@ public class CaptureService extends Service {
     private static final String CHANNEL = "cardlens_live";
     private static final int NOTIFICATION_ID = 42;
 
-    // Fast enough for five-second auctions without running ML Kit flat-out continuously.
-    private static final long FAST_OCR_INTERVAL_MS = 190;
+    // Normal scanning is deliberately moderate for thermals. A plausible card starts a short burst
+    // so the second confirming read can still land quickly in a five-second auction.
+    private static final long BASE_OCR_INTERVAL_MS = 230;
+    private static final long BURST_OCR_INTERVAL_MS = 150;
     private static final long RESOLVING_OCR_INTERVAL_MS = 360;
-    private static final long CONFIRMED_OCR_INTERVAL_MS = 420;
-    private static final long STABILITY_WINDOW_MS = 1500;
+    private static final long CONFIRMED_OCR_INTERVAL_MS = 460;
+    private static final long BURST_DURATION_MS = 720;
+    private static final long BURST_COOLDOWN_MS = 1350;
+    private static final long ACTIVE_EVIDENCE_TTL_MS = 2200;
     private static final long LOOKUP_DEDUP_MS = 5000;
+    private static final long AMBIGUOUS_RETRY_MS = 700;
     private static final long NETWORK_BACKOFF_MS = 3500;
     private static final long RATE_LIMIT_BACKOFF_MS = 60000;
     private static final int CAPTURE_MAX_WIDTH = 640;
@@ -75,6 +80,8 @@ public class CaptureService extends Service {
     private final ExecutorService network = Executors.newSingleThreadExecutor();
     private final PokemonTcgClient client = new PokemonTcgClient();
     private final Map<String, Long> lookupStartedAt = new ConcurrentHashMap<>();
+    private final BestFrameBuffer bestFrames = new BestFrameBuffer();
+    private final EvidenceWindow evidence = new EvidenceWindow();
 
     private HandlerThread captureThread;
     private Handler captureHandler;
@@ -86,12 +93,15 @@ public class CaptureService extends Service {
     private OverlayController overlay;
 
     private long lastOcrAt;
-    private long pendingLastSeenAt;
     private long lookupBackoffUntil;
     private long lastConfirmedAt;
-    private String pendingKey = "";
-    private int pendingHits;
+    private long activeLastSeenAt;
+    private long burstUntil;
+    private long nextBurstAllowedAt;
+    private long lastMotionNoticeAt;
+    private String activeKey = "";
     private String shownKey = "";
+    private CardNumberParser.Candidate activeCandidate;
     private int ocrSequence;
 
     @Override public void onCreate() {
@@ -177,12 +187,15 @@ public class CaptureService extends Service {
 
     private long currentOcrInterval(long now) {
         if (lookupsInFlight.get() > 0) return RESOLVING_OCR_INTERVAL_MS;
+        if (now < burstUntil) return BURST_OCR_INTERVAL_MS;
         if (!shownKey.isEmpty() && now - lastConfirmedAt < 5000) return CONFIRMED_OCR_INTERVAL_MS;
-        return FAST_OCR_INTERVAL_MS;
+        return BASE_OCR_INTERVAL_MS;
     }
 
     private void onLocalFrame(ImageReader reader) {
         long now = SystemClock.elapsedRealtime();
+        if (!shownKey.isEmpty() && now - lastConfirmedAt > 4800) shownKey = "";
+
         long interval = currentOcrInterval(now);
         if (now - lastOcrAt < interval || !ocrBusy.compareAndSet(false, true)) {
             Image skipped = reader.acquireLatestImage();
@@ -211,12 +224,28 @@ public class CaptureService extends Service {
         Bitmap ocrFrame = cropForFastOcr(fullFrame);
         if (ocrFrame != fullFrame) fullFrame.recycle();
 
+        final long frameAt = SystemClock.elapsedRealtime();
+        FrameQuality.Result quality = FrameQuality.analyze(ocrFrame);
+        bestFrames.offer(ocrFrame, quality.quality(), frameAt);
+
+        // Do not send a heavily smeared frame through ML Kit. The best-frame buffer still keeps any
+        // usable recent frame, so motion can subside briefly and identification can proceed without
+        // starting from zero.
+        if (!quality.worthOcr()) {
+            maybeShowMotionState(frameAt);
+            maybeResolveActive(frameAt);
+            if (!ocrFrame.isRecycled()) ocrFrame.recycle();
+            ocrBusy.set(false);
+            return;
+        }
+
         final long ocrStartedAt = SystemClock.elapsedRealtime();
         recognizer.process(InputImage.fromBitmap(ocrFrame, 0))
                 .addOnSuccessListener(captureExecutor, result -> {
                     long elapsed = SystemClock.elapsedRealtime() - ocrStartedAt;
-                    Log.d(TAG, "OCR " + elapsed + "ms");
-                    processOcrText(result.getText(), ocrFrame);
+                    Log.d(TAG, "OCR " + elapsed + "ms q=" +
+                            String.format(java.util.Locale.US, "%.2f", quality.quality()));
+                    processOcrText(result.getText(), ocrFrame, quality, frameAt);
                 })
                 .addOnFailureListener(captureExecutor,
                         e -> Log.w(TAG, "On-device OCR failed", e))
@@ -226,6 +255,14 @@ public class CaptureService extends Service {
                 });
     }
 
+    private void maybeShowMotionState(long now) {
+        if (now - lastMotionNoticeAt < 850) return;
+        lastMotionNoticeAt = now;
+        if (activeCandidate != null || shownKey.isEmpty()) {
+            main.post(() -> overlay.showMessage("MOTION BUFFERING"));
+        }
+    }
+
     private Bitmap cropForFastOcr(Bitmap bitmap) {
         ocrSequence++;
         boolean wideFallback = ocrSequence % WIDE_SCAN_EVERY == 0;
@@ -233,8 +270,6 @@ public class CaptureService extends Service {
         int width = bitmap.getWidth();
         int height = bitmap.getHeight();
 
-        // The overlay normally sits near the top. Most passes exclude much of that area so ML Kit
-        // spends its budget on the actual stream/card instead of repeatedly OCRing CardLens itself.
         float leftPct = wideFallback ? 0.00f : 0.06f;
         float rightPct = wideFallback ? 1.00f : 0.94f;
         float topPct = wideFallback ? 0.08f : 0.22f;
@@ -270,70 +305,86 @@ public class CaptureService extends Service {
         return cropped;
     }
 
-    private void processOcrText(String text, Bitmap currentFrame) {
-        final long now = SystemClock.elapsedRealtime();
+    private void processOcrText(String text, Bitmap currentFrame,
+                                FrameQuality.Result quality, long frameAt) {
         Optional<CardNumberParser.Candidate> parsed = CardNumberParser.parse(text);
+        String parsedKey = parsed.isPresent() ? parsed.get().key() : "";
+        evidence.record(parsedKey, text, quality.quality(), frameAt);
 
-        if (parsed.isEmpty()) {
-            if (now - pendingLastSeenAt > STABILITY_WINDOW_MS) {
-                pendingKey = "";
-                pendingHits = 0;
+        if (parsed.isPresent()) {
+            CardNumberParser.Candidate candidate = parsed.get();
+            int candidateVotes = evidence.votes(candidate.key(), frameAt);
+            int activeVotes = evidence.votes(activeKey, frameAt);
+            boolean activeExpired = activeCandidate == null
+                    || frameAt - activeLastSeenAt > ACTIVE_EVIDENCE_TTL_MS;
+
+            if (candidate.key().equals(activeKey)) {
+                activeCandidate = candidate;
+                activeLastSeenAt = frameAt;
+            } else if (activeExpired || candidateVotes > activeVotes) {
+                boolean replacingExisting = !activeKey.isEmpty();
+                activeCandidate = candidate;
+                activeKey = candidate.key();
+                activeLastSeenAt = frameAt;
+
+                // If this is a real card transition, don't let the previous card's sharp frame win.
+                // Re-offer the current frame immediately so we still retain a good image this cycle.
+                if (replacingExisting) {
+                    bestFrames.clear();
+                    bestFrames.offer(currentFrame, quality.quality(), frameAt);
+                }
             }
-            return;
+
+            if (candidate.key().equals(activeKey)) {
+                if (candidateVotes == 1) {
+                    startShortBurst(frameAt);
+                    main.post(() -> overlay.showMessage(
+                            "CANDIDATE #" + activeKey + " — TRACKING"));
+                }
+                if (!shownKey.isEmpty() && !shownKey.equals(activeKey) && candidateVotes >= 2) {
+                    shownKey = "";
+                }
+            }
+        } else if (activeCandidate != null
+                && frameAt - activeLastSeenAt > ACTIVE_EVIDENCE_TTL_MS) {
+            activeCandidate = null;
+            activeKey = "";
         }
 
-        CardNumberParser.Candidate candidate = parsed.get();
-        String key = candidate.key();
-
-        // A different collector number means a new card/auction and restores the fast cadence.
-        if (!shownKey.isEmpty() && !shownKey.equals(key)) shownKey = "";
-
-        if (key.equals(pendingKey) && now - pendingLastSeenAt <= STABILITY_WINDOW_MS) {
-            pendingHits++;
-        } else {
-            pendingKey = key;
-            pendingHits = 1;
-        }
-        pendingLastSeenAt = now;
-
-        if (key.equals(shownKey)) return;
-
-        // First hit is deliberately cheap. At ~190 ms cadence, a second good read is normally only
-        // a fraction of a second away, but this gate prevents noisy OCR from starting image/network
-        // work several times per second and dramatically reduces heat/API pressure.
-        if (pendingHits == 1) {
-            main.post(() -> overlay.showMessage("CANDIDATE #" + key + " — VERIFYING"));
-            return;
-        }
-
-        boolean lookupStarted = maybeStartLookup(candidate, text, currentFrame);
-        if (lookupStarted) {
-            main.post(() -> overlay.showMessage("VISUAL MATCH #" + key + " — IDENTIFYING"));
-        } else if (lookupsInFlight.get() > 0) {
-            main.post(() -> overlay.showMessage("IDENTIFYING #" + key));
-        }
+        maybeResolveActive(frameAt);
     }
 
-    private boolean maybeStartLookup(CardNumberParser.Candidate candidate, String ocrText,
-                                     Bitmap currentFrame) {
-        String key = candidate.key();
-        long now = SystemClock.elapsedRealtime();
+    private void startShortBurst(long now) {
+        if (now < nextBurstAllowedAt) return;
+        burstUntil = now + BURST_DURATION_MS;
+        nextBurstAllowedAt = now + BURST_COOLDOWN_MS;
+    }
 
+    private boolean maybeResolveActive(long now) {
+        CardNumberParser.Candidate candidate = activeCandidate;
+        String key = activeKey;
+        if (candidate == null || key.isEmpty() || key.equals(shownKey)) return false;
+        if (evidence.votes(key, now) < 2) return false;
         if (now < lookupBackoffUntil) return false;
-        Long previous = lookupStartedAt.get(key);
-        if (previous != null && now - previous < LOOKUP_DEDUP_MS) return false;
         if (lookupsInFlight.get() >= MAX_PARALLEL_LOOKUPS) return false;
 
-        // Artwork fingerprinting is the expensive local step. Do it only after a stable candidate
-        // exists, never on every OCR frame.
-        VisualMatcher.LiveSignature visualSignature = VisualMatcher.fromLiveFrame(currentFrame);
-        if (!visualSignature.isUsable()) return false;
+        Long previous = lookupStartedAt.get(key);
+        if (previous != null && now - previous < LOOKUP_DEDUP_MS) return false;
 
+        VisualMatcher.LiveSignature visualSignature = bestFrames.createSignature(now);
+        if (visualSignature == null || !visualSignature.isUsable()) {
+            maybeShowMotionState(now);
+            return false;
+        }
+
+        String mergedOcr = evidence.mergedText(key, now);
         lookupStartedAt.put(key, now);
         trimLookupHistory(now);
         lookupsInFlight.incrementAndGet();
-        String ocrSnapshot = ocrText;
-        network.submit(() -> lookupCard(candidate, ocrSnapshot, visualSignature));
+
+        main.post(() -> overlay.showMessage(
+                "VISUAL MATCH #" + key + " — BEST FRAME"));
+        network.submit(() -> lookupCard(candidate, key, mergedOcr, visualSignature));
         return true;
     }
 
@@ -344,29 +395,31 @@ public class CaptureService extends Service {
         }
     }
 
-    private void lookupCard(CardNumberParser.Candidate candidate, String ocrText,
+    private void lookupCard(CardNumberParser.Candidate candidate, String key, String ocrText,
                             VisualMatcher.LiveSignature visualSignature) {
-        String key = candidate.key();
         long started = SystemClock.elapsedRealtime();
         try {
             MarketCard card = client.lookup(candidate, ocrText, visualSignature);
             long elapsed = SystemClock.elapsedRealtime() - started;
-            Log.d(TAG, "Hybrid lookup " + key + " " + elapsed + "ms");
+            Log.d(TAG, "Motion-tolerant lookup " + key + " " + elapsed + "ms");
 
             if (card == null) {
-                if (key.equals(pendingKey)) {
+                // Allow another clear-frame attempt soon instead of freezing the candidate for the
+                // full dedup period. A host may have tilted or shaken the first retained frame.
+                lookupStartedAt.put(key,
+                        SystemClock.elapsedRealtime() - LOOKUP_DEDUP_MS + AMBIGUOUS_RETRY_MS);
+                if (key.equals(activeKey)) {
                     main.post(() -> overlay.showMessage(
-                            "AMBIGUOUS #" + key + " — HOLD STEADY"));
+                            "AMBIGUOUS #" + key + " — COLLECTING FRAMES"));
                 }
                 return;
             }
 
-            // Strong artwork evidence can resolve on the same verified candidate without waiting
-            // for another OCR cycle. Otherwise two OCR hits are already present by construction.
-            if (key.equals(pendingKey)
-                    && SystemClock.elapsedRealtime() - pendingLastSeenAt <= STABILITY_WINDOW_MS + 1200) {
+            if (key.equals(activeKey)
+                    || SystemClock.elapsedRealtime() - activeLastSeenAt <= ACTIVE_EVIDENCE_TTL_MS + 1600) {
                 shownKey = key;
                 lastConfirmedAt = SystemClock.elapsedRealtime();
+                bestFrames.clear();
                 main.post(() -> overlay.showCard(card));
             }
         } catch (Exception e) {
@@ -376,7 +429,7 @@ public class CaptureService extends Service {
                     + (rateLimited ? RATE_LIMIT_BACKOFF_MS : NETWORK_BACKOFF_MS);
             Log.w(TAG, "Card identification failed for " + key, e);
 
-            if (key.equals(pendingKey)) {
+            if (key.equals(activeKey)) {
                 if (rateLimited) {
                     main.post(() -> overlay.showMessage("CARD DATA RATE LIMITED"));
                 } else {
@@ -399,7 +452,7 @@ public class CaptureService extends Service {
         return new Notification.Builder(this, CHANNEL)
                 .setSmallIcon(R.drawable.ic_launcher)
                 .setContentTitle("CardLens Live")
-                .setContentText("Efficient live illustration matching is active")
+                .setContentText("Motion-tolerant live card scan is active")
                 .setOngoing(true)
                 .setContentIntent(open)
                 .addAction(new Notification.Action.Builder(null, "Stop", stop).build())
@@ -415,6 +468,8 @@ public class CaptureService extends Service {
     }
 
     @Override public void onDestroy() {
+        bestFrames.clear();
+        evidence.clear();
         if (imageReader != null) {
             imageReader.setOnImageAvailableListener(null, null);
             imageReader.close();
