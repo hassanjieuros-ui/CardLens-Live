@@ -28,6 +28,7 @@ import android.util.Log;
 import com.google.mlkit.vision.common.InputImage;
 import com.google.mlkit.vision.text.TextRecognition;
 import com.google.mlkit.vision.text.TextRecognizer;
+import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions;
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
 
 import java.nio.ByteBuffer;
@@ -40,13 +41,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/**
- * User-consented screen-share service for CardLens Live.
- *
- * Frames are processed in memory only. Raw screen images are never saved or transmitted. v0.7
- * adds motion tolerance by rejecting heavily blurred frames, retaining only the clearest recent
- * downscaled frame and fusing OCR evidence across a short rolling window.
- */
+/** User-consented EN + JP live card scanner. Raw frames stay on-device. */
 public class CaptureService extends Service {
     public static final String ACTION_START = "com.cardlens.live.START";
     public static final String ACTION_STOP = "com.cardlens.live.STOP";
@@ -57,12 +52,12 @@ public class CaptureService extends Service {
     private static final String CHANNEL = "cardlens_live";
     private static final int NOTIFICATION_ID = 42;
 
-    // Normal scanning is deliberately moderate for thermals. A plausible card starts a short burst
-    // so the second confirming read can still land quickly in a five-second auction.
     private static final long BASE_OCR_INTERVAL_MS = 230;
     private static final long BURST_OCR_INTERVAL_MS = 150;
     private static final long RESOLVING_OCR_INTERVAL_MS = 360;
     private static final long CONFIRMED_OCR_INTERVAL_MS = 460;
+    private static final long JAPANESE_PROBE_INTERVAL_MS = 900;
+    private static final long JAPANESE_TEXT_TTL_MS = 2800;
     private static final long BURST_DURATION_MS = 720;
     private static final long BURST_COOLDOWN_MS = 1350;
     private static final long ACTIVE_EVIDENCE_TTL_MS = 2200;
@@ -72,15 +67,18 @@ public class CaptureService extends Service {
     private static final long NETWORK_BACKOFF_MS = 3500;
     private static final long RATE_LIMIT_BACKOFF_MS = 60000;
     private static final int CAPTURE_MAX_WIDTH = 640;
+    private static final int JAPANESE_PROBE_MAX_WIDTH = 420;
     private static final int MAX_PARALLEL_LOOKUPS = 1;
     private static final int MAX_AMBIGUOUS_ATTEMPTS = 2;
     private static final int WIDE_SCAN_EVERY = 8;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final AtomicBoolean ocrBusy = new AtomicBoolean(false);
+    private final AtomicBoolean japaneseBusy = new AtomicBoolean(false);
     private final AtomicInteger lookupsInFlight = new AtomicInteger(0);
     private final ExecutorService network = Executors.newSingleThreadExecutor();
-    private final PokemonTcgClient client = new PokemonTcgClient();
+    private final PokemonTcgClient englishClient = new PokemonTcgClient();
+    private final TcgDexClient japaneseClient = new TcgDexClient();
     private final Map<String, Long> lookupStartedAt = new ConcurrentHashMap<>();
     private final Map<String, Integer> ambiguousAttempts = new ConcurrentHashMap<>();
     private final Map<String, Long> blockedCandidates = new ConcurrentHashMap<>();
@@ -93,16 +91,20 @@ public class CaptureService extends Service {
     private MediaProjection projection;
     private VirtualDisplay virtualDisplay;
     private ImageReader imageReader;
-    private TextRecognizer recognizer;
+    private TextRecognizer latinRecognizer;
+    private TextRecognizer japaneseRecognizer;
     private OverlayController overlay;
 
     private long lastOcrAt;
+    private long lastJapaneseProbeAt;
+    private long recentJapaneseAt;
     private long lookupBackoffUntil;
     private long lastConfirmedAt;
     private long activeLastSeenAt;
     private long burstUntil;
     private long nextBurstAllowedAt;
     private long lastMotionNoticeAt;
+    private String recentJapaneseText = "";
     private String activeKey = "";
     private String shownKey = "";
     private CardNumberParser.Candidate activeCandidate;
@@ -112,7 +114,9 @@ public class CaptureService extends Service {
         super.onCreate();
         createChannel();
         overlay = new OverlayController(this);
-        recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
+        latinRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
+        japaneseRecognizer = TextRecognition.getClient(
+                new JapaneseTextRecognizerOptions.Builder().build());
         captureThread = new HandlerThread("CardLensLocalFrames");
         captureThread.start();
         captureHandler = new Handler(captureThread.getLooper());
@@ -167,9 +171,7 @@ public class CaptureService extends Service {
         }
 
         projection.registerCallback(new MediaProjection.Callback() {
-            @Override public void onStop() {
-                stopSelf();
-            }
+            @Override public void onStop() { stopSelf(); }
         }, main);
 
         DisplayMetrics dm = getResources().getDisplayMetrics();
@@ -181,10 +183,7 @@ public class CaptureService extends Service {
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2);
         imageReader.setOnImageAvailableListener(this::onLocalFrame, captureHandler);
         virtualDisplay = projection.createVirtualDisplay(
-                "CardLensUserShare",
-                width,
-                height,
-                dm.densityDpi,
+                "CardLensUserShare", width, height, dm.densityDpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 imageReader.getSurface(), null, captureHandler);
     }
@@ -200,8 +199,7 @@ public class CaptureService extends Service {
         long now = SystemClock.elapsedRealtime();
         if (!shownKey.isEmpty() && now - lastConfirmedAt > 4800) shownKey = "";
 
-        long interval = currentOcrInterval(now);
-        if (now - lastOcrAt < interval || !ocrBusy.compareAndSet(false, true)) {
+        if (now - lastOcrAt < currentOcrInterval(now) || !ocrBusy.compareAndSet(false, true)) {
             Image skipped = reader.acquireLatestImage();
             if (skipped != null) skipped.close();
             return;
@@ -232,9 +230,6 @@ public class CaptureService extends Service {
         FrameQuality.Result quality = FrameQuality.analyze(ocrFrame);
         bestFrames.offer(ocrFrame, quality.quality(), frameAt);
 
-        // Do not send a heavily smeared frame through ML Kit. The best-frame buffer still keeps any
-        // usable recent frame, so motion can subside briefly and identification can proceed without
-        // starting from zero.
         if (!quality.worthOcr()) {
             maybeShowMotionState(frameAt);
             maybeResolveActive(frameAt);
@@ -244,19 +239,66 @@ public class CaptureService extends Service {
         }
 
         final long ocrStartedAt = SystemClock.elapsedRealtime();
-        recognizer.process(InputImage.fromBitmap(ocrFrame, 0))
+        latinRecognizer.process(InputImage.fromBitmap(ocrFrame, 0))
                 .addOnSuccessListener(captureExecutor, result -> {
-                    long elapsed = SystemClock.elapsedRealtime() - ocrStartedAt;
-                    Log.d(TAG, "OCR " + elapsed + "ms q=" +
-                            String.format(java.util.Locale.US, "%.2f", quality.quality()));
-                    processOcrText(result.getText(), ocrFrame, quality, frameAt);
+                    String latinText = result.getText();
+                    Log.d(TAG, "Latin OCR " + (SystemClock.elapsedRealtime() - ocrStartedAt) + "ms");
+                    processOcrText(latinText, ocrFrame, quality, frameAt);
+                    maybeStartJapaneseProbe(ocrFrame, quality, frameAt, latinText);
                 })
                 .addOnFailureListener(captureExecutor,
-                        e -> Log.w(TAG, "On-device OCR failed", e))
+                        e -> Log.w(TAG, "Latin OCR failed", e))
                 .addOnCompleteListener(captureExecutor, task -> {
                     if (!ocrFrame.isRecycled()) ocrFrame.recycle();
                     ocrBusy.set(false);
                 });
+    }
+
+    private void maybeStartJapaneseProbe(Bitmap source, FrameQuality.Result quality,
+                                         long frameAt, String latinText) {
+        if (japaneseRecognizer == null || source == null || source.isRecycled()) return;
+        if (!shownKey.isEmpty()) return;
+        if (frameAt - lastJapaneseProbeAt < JAPANESE_PROBE_INTERVAL_MS) return;
+        if (!japaneseBusy.compareAndSet(false, true)) return;
+
+        lastJapaneseProbeAt = frameAt;
+        int width = Math.min(JAPANESE_PROBE_MAX_WIDTH, source.getWidth());
+        int height = Math.max(1, Math.round(source.getHeight() * (width / (float) source.getWidth())));
+        Bitmap probe = Bitmap.createScaledBitmap(source, width, height, true);
+
+        japaneseRecognizer.process(InputImage.fromBitmap(probe, 0))
+                .addOnSuccessListener(captureExecutor, result ->
+                        processJapaneseSupplement(result.getText(), latinText, quality, frameAt))
+                .addOnFailureListener(captureExecutor,
+                        e -> Log.d(TAG, "Japanese OCR probe failed", e))
+                .addOnCompleteListener(captureExecutor, task -> {
+                    if (!probe.isRecycled()) probe.recycle();
+                    japaneseBusy.set(false);
+                });
+    }
+
+    private void processJapaneseSupplement(String text, String latinText,
+                                           FrameQuality.Result quality, long frameAt) {
+        if (text == null || text.trim().isEmpty()) return;
+
+        if (LanguageUtil.containsJapanese(text)) {
+            recentJapaneseText = text;
+            recentJapaneseAt = frameAt;
+        }
+
+        Optional<CardNumberParser.Candidate> jpParsed = CardNumberParser.parse(text);
+        Optional<CardNumberParser.Candidate> latinParsed = CardNumberParser.parse(latinText);
+        boolean duplicateSameFrame = jpParsed.isPresent() && latinParsed.isPresent()
+                && jpParsed.get().key().equals(latinParsed.get().key());
+
+        if (jpParsed.isPresent() && !duplicateSameFrame
+                && !isCandidateBlocked(jpParsed.get().key(), frameAt)) {
+            evidence.record(jpParsed.get().key(), text, quality.quality(), frameAt);
+            handleCandidate(jpParsed.get(), null, quality, frameAt);
+        } else {
+            evidence.record("", text, quality.quality(), frameAt);
+        }
+        maybeResolveActive(frameAt);
     }
 
     private void maybeShowMotionState(long now) {
@@ -270,15 +312,10 @@ public class CaptureService extends Service {
     private Bitmap cropForFastOcr(Bitmap bitmap) {
         ocrSequence++;
         boolean wideFallback = ocrSequence % WIDE_SCAN_EVERY == 0;
-
         int width = bitmap.getWidth();
         int height = bitmap.getHeight();
-
         float leftPct = wideFallback ? 0.00f : 0.06f;
         float rightPct = wideFallback ? 1.00f : 0.94f;
-        // The default CardLens overlay occupies the upper portion of the stream. Keep normal OCR
-        // below it so the scanner cannot read its own status text; wide fallback still samples the
-        // upper card/name area occasionally without showing raw collector fractions in the overlay.
         float topPct = wideFallback ? 0.10f : 0.28f;
         float bottomPct = wideFallback ? 0.88f : 0.86f;
 
@@ -288,7 +325,6 @@ public class CaptureService extends Service {
         int bottom = Math.min(height, Math.round(height * bottomPct));
         int cropWidth = right - left;
         int cropHeight = bottom - top;
-
         if (cropWidth < width / 2 || cropHeight < height / 2) return bitmap;
         return Bitmap.createBitmap(bitmap, left, top, cropWidth, cropHeight);
     }
@@ -300,14 +336,10 @@ public class CaptureService extends Service {
         int rowStride = plane.getRowStride();
         int rowPadding = rowStride - pixelStride * image.getWidth();
         int paddedWidth = image.getWidth() + rowPadding / pixelStride;
-
-        Bitmap padded = Bitmap.createBitmap(
-                paddedWidth, image.getHeight(), Bitmap.Config.ARGB_8888);
+        Bitmap padded = Bitmap.createBitmap(paddedWidth, image.getHeight(), Bitmap.Config.ARGB_8888);
         padded.copyPixelsFromBuffer(buffer);
         if (paddedWidth == image.getWidth()) return padded;
-
-        Bitmap cropped = Bitmap.createBitmap(
-                padded, 0, 0, image.getWidth(), image.getHeight());
+        Bitmap cropped = Bitmap.createBitmap(padded, 0, 0, image.getWidth(), image.getHeight());
         padded.recycle();
         return cropped;
     }
@@ -318,51 +350,50 @@ public class CaptureService extends Service {
         if (parsed.isPresent() && isCandidateBlocked(parsed.get().key(), frameAt)) {
             parsed = Optional.empty();
         }
-
         String parsedKey = parsed.isPresent() ? parsed.get().key() : "";
         evidence.record(parsedKey, text, quality.quality(), frameAt);
 
         if (parsed.isPresent()) {
-            CardNumberParser.Candidate candidate = parsed.get();
-            int candidateVotes = evidence.votes(candidate.key(), frameAt);
-            int activeVotes = evidence.votes(activeKey, frameAt);
-            boolean activeExpired = activeCandidate == null
-                    || frameAt - activeLastSeenAt > ACTIVE_EVIDENCE_TTL_MS;
-
-            if (candidate.key().equals(activeKey)) {
-                activeCandidate = candidate;
-                activeLastSeenAt = frameAt;
-            } else if (activeExpired || candidateVotes > activeVotes) {
-                boolean replacingExisting = !activeKey.isEmpty();
-                activeCandidate = candidate;
-                activeKey = candidate.key();
-                activeLastSeenAt = frameAt;
-
-                // If this is a real card transition, don't let the previous card's sharp frame win.
-                // Re-offer the current frame immediately so we still retain a good image this cycle.
-                if (replacingExisting) {
-                    bestFrames.clear();
-                    bestFrames.offer(currentFrame, quality.quality(), frameAt);
-                }
-            }
-
-            if (candidate.key().equals(activeKey)) {
-                if (candidateVotes == 1) {
-                    startShortBurst(frameAt);
-                    main.post(() -> overlay.showMessage(
-                            "CANDIDATE #" + activeKey + " — TRACKING"));
-                }
-                if (!shownKey.isEmpty() && !shownKey.equals(activeKey) && candidateVotes >= 2) {
-                    shownKey = "";
-                }
-            }
-        } else if (activeCandidate != null
-                && frameAt - activeLastSeenAt > ACTIVE_EVIDENCE_TTL_MS) {
+            handleCandidate(parsed.get(), currentFrame, quality, frameAt);
+        } else if (activeCandidate != null && frameAt - activeLastSeenAt > ACTIVE_EVIDENCE_TTL_MS) {
             activeCandidate = null;
             activeKey = "";
         }
-
         maybeResolveActive(frameAt);
+    }
+
+    private void handleCandidate(CardNumberParser.Candidate candidate, Bitmap currentFrame,
+                                 FrameQuality.Result quality, long frameAt) {
+        int candidateVotes = evidence.votes(candidate.key(), frameAt);
+        int activeVotes = evidence.votes(activeKey, frameAt);
+        boolean activeExpired = activeCandidate == null
+                || frameAt - activeLastSeenAt > ACTIVE_EVIDENCE_TTL_MS;
+
+        if (candidate.key().equals(activeKey)) {
+            activeCandidate = candidate;
+            activeLastSeenAt = frameAt;
+        } else if (activeExpired || candidateVotes > activeVotes) {
+            boolean replacingExisting = !activeKey.isEmpty();
+            activeCandidate = candidate;
+            activeKey = candidate.key();
+            activeLastSeenAt = frameAt;
+            if (replacingExisting) {
+                bestFrames.clear();
+                if (currentFrame != null && !currentFrame.isRecycled()) {
+                    bestFrames.offer(currentFrame, quality.quality(), frameAt);
+                }
+            }
+        }
+
+        if (candidate.key().equals(activeKey)) {
+            if (candidateVotes == 1) {
+                startShortBurst(frameAt);
+                main.post(() -> overlay.showMessage("CANDIDATE — TRACKING"));
+            }
+            if (!shownKey.isEmpty() && !shownKey.equals(activeKey) && candidateVotes >= 2) {
+                shownKey = "";
+            }
+        }
     }
 
     private boolean isCandidateBlocked(String key, long now) {
@@ -381,7 +412,6 @@ public class CaptureService extends Service {
         blockedCandidates.put(key, now + FALSE_CANDIDATE_BLOCK_MS);
         ambiguousAttempts.remove(key);
         lookupStartedAt.remove(key);
-
         if (key.equals(activeKey)) {
             activeCandidate = null;
             activeKey = "";
@@ -390,7 +420,6 @@ public class CaptureService extends Service {
             evidence.clear();
             bestFrames.clear();
         }
-
         main.post(() -> overlay.showMessage("FALSE CANDIDATE DROPPED"));
     }
 
@@ -406,8 +435,7 @@ public class CaptureService extends Service {
         if (candidate == null || key.isEmpty() || key.equals(shownKey)) return false;
         if (isCandidateBlocked(key, now)) return false;
         if (evidence.votes(key, now) < 2) return false;
-        if (now < lookupBackoffUntil) return false;
-        if (lookupsInFlight.get() >= MAX_PARALLEL_LOOKUPS) return false;
+        if (now < lookupBackoffUntil || lookupsInFlight.get() >= MAX_PARALLEL_LOOKUPS) return false;
 
         Long previous = lookupStartedAt.get(key);
         if (previous != null && now - previous < LOOKUP_DEDUP_MS) return false;
@@ -419,13 +447,19 @@ public class CaptureService extends Service {
         }
 
         String mergedOcr = evidence.mergedText(key, now);
+        if (now - recentJapaneseAt <= JAPANESE_TEXT_TTL_MS && !recentJapaneseText.isEmpty()) {
+            mergedOcr = mergedOcr + "\n" + recentJapaneseText;
+        }
+        final String lookupText = mergedOcr;
+        final boolean japaneseEvidence = LanguageUtil.containsJapanese(lookupText);
+
         lookupStartedAt.put(key, now);
         trimLookupHistory(now);
         lookupsInFlight.incrementAndGet();
-
-        main.post(() -> overlay.showMessage(
-                "VISUAL MATCH #" + key + " — BEST FRAME"));
-        network.submit(() -> lookupCard(candidate, key, mergedOcr, visualSignature));
+        main.post(() -> overlay.showMessage(japaneseEvidence
+                ? "VISUAL MATCH — JP + ART"
+                : "VISUAL MATCH — EN + ART"));
+        network.submit(() -> lookupCard(candidate, key, lookupText, visualSignature, japaneseEvidence));
         return true;
     }
 
@@ -441,27 +475,50 @@ public class CaptureService extends Service {
     }
 
     private void lookupCard(CardNumberParser.Candidate candidate, String key, String ocrText,
-                            VisualMatcher.LiveSignature visualSignature) {
+                            VisualMatcher.LiveSignature visualSignature, boolean japaneseEvidence) {
         long started = SystemClock.elapsedRealtime();
         try {
-            MarketCard card = client.lookup(candidate, ocrText, visualSignature);
-            long elapsed = SystemClock.elapsedRealtime() - started;
-            Log.d(TAG, "Motion-tolerant lookup " + key + " " + elapsed + "ms");
+            MarketCard card = null;
+            Exception firstError = null;
+
+            if (japaneseEvidence) {
+                try {
+                    card = japaneseClient.lookup(candidate, ocrText, visualSignature);
+                } catch (Exception e) {
+                    firstError = e;
+                }
+            } else {
+                try {
+                    card = englishClient.lookup(candidate, ocrText, visualSignature);
+                } catch (Exception e) {
+                    firstError = e;
+                }
+                // A Japanese card can still have a perfectly readable Latin collector number.
+                // If the English catalog/artwork does not fit, try the Japanese catalog before
+                // declaring the candidate false.
+                if (card == null) {
+                    try {
+                        card = japaneseClient.lookup(candidate, ocrText, visualSignature);
+                    } catch (Exception ignored) {
+                        // Preserve the first provider error if both fail.
+                    }
+                }
+            }
+
+            if (card == null && firstError != null) throw firstError;
+            Log.d(TAG, "EN/JP lookup " + key + " "
+                    + (SystemClock.elapsedRealtime() - started) + "ms");
 
             if (card == null) {
                 int attempts = ambiguousAttempts.merge(key, 1, Integer::sum);
                 if (attempts >= MAX_AMBIGUOUS_ATTEMPTS) {
-                    Log.i(TAG, "Dropping repeatedly unsupported candidate " + key);
                     dropFalseCandidate(key);
                     return;
                 }
-
-                // Allow one newer clear-frame attempt before declaring the OCR candidate false.
                 lookupStartedAt.put(key,
                         SystemClock.elapsedRealtime() - LOOKUP_DEDUP_MS + AMBIGUOUS_RETRY_MS);
                 if (key.equals(activeKey)) {
-                    main.post(() -> overlay.showMessage(
-                            "AMBIGUOUS #" + key + " — COLLECTING FRAMES"));
+                    main.post(() -> overlay.showMessage("AMBIGUOUS — COLLECTING FRAMES"));
                 }
                 return;
             }
@@ -481,13 +538,9 @@ public class CaptureService extends Service {
             lookupBackoffUntil = SystemClock.elapsedRealtime()
                     + (rateLimited ? RATE_LIMIT_BACKOFF_MS : NETWORK_BACKOFF_MS);
             Log.w(TAG, "Card identification failed for " + key, e);
-
             if (key.equals(activeKey)) {
-                if (rateLimited) {
-                    main.post(() -> overlay.showMessage("CARD DATA RATE LIMITED"));
-                } else {
-                    main.post(() -> overlay.showMessage("IDENTIFICATION RETRYING"));
-                }
+                main.post(() -> overlay.showMessage(rateLimited
+                        ? "CARD DATA RATE LIMITED" : "IDENTIFICATION RETRYING"));
             }
         } finally {
             lookupsInFlight.decrementAndGet();
@@ -501,11 +554,10 @@ public class CaptureService extends Service {
         PendingIntent stop = PendingIntent.getService(
                 this, 2, new Intent(this, CaptureService.class).setAction(ACTION_STOP),
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
-
         return new Notification.Builder(this, CHANNEL)
                 .setSmallIcon(R.drawable.ic_launcher)
                 .setContentTitle("CardLens Live")
-                .setContentText("Motion-tolerant live card scan is active")
+                .setContentText("English + Japanese live card scan is active")
                 .setOngoing(true)
                 .setContentIntent(open)
                 .addAction(new Notification.Action.Builder(null, "Stop", stop).build())
@@ -538,7 +590,8 @@ public class CaptureService extends Service {
             try { projection.stop(); } catch (Exception ignored) {}
             projection = null;
         }
-        if (recognizer != null) recognizer.close();
+        if (latinRecognizer != null) latinRecognizer.close();
+        if (japaneseRecognizer != null) japaneseRecognizer.close();
         if (overlay != null) main.post(() -> overlay.remove());
         if (captureThread != null) captureThread.quitSafely();
         network.shutdownNow();
@@ -546,7 +599,5 @@ public class CaptureService extends Service {
         super.onDestroy();
     }
 
-    @Override public IBinder onBind(Intent intent) {
-        return null;
-    }
+    @Override public IBinder onBind(Intent intent) { return null; }
 }
