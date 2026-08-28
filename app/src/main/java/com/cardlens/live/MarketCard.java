@@ -13,10 +13,18 @@ public final class MarketCard {
     private final int priceVariants;
     private final String priceUpdatedAt;
     private final double confidence;
+    private final String language;
 
     public MarketCard(String id, String name, String setName, String number, String rarity,
                       double marketLow, double marketHigh, int priceVariants,
                       String priceUpdatedAt, double confidence) {
+        this(id, name, setName, number, rarity, marketLow, marketHigh, priceVariants,
+                priceUpdatedAt, confidence, "EN");
+    }
+
+    public MarketCard(String id, String name, String setName, String number, String rarity,
+                      double marketLow, double marketHigh, int priceVariants,
+                      String priceUpdatedAt, double confidence, String language) {
         this.id = id;
         this.name = name;
         this.setName = setName;
@@ -27,6 +35,7 @@ public final class MarketCard {
         this.priceVariants = priceVariants;
         this.priceUpdatedAt = priceUpdatedAt;
         this.confidence = confidence;
+        this.language = language == null || language.trim().isEmpty() ? "EN" : language;
     }
 
     public String id() { return id; }
@@ -39,6 +48,7 @@ public final class MarketCard {
     public int priceVariants() { return priceVariants; }
     public String priceUpdatedAt() { return priceUpdatedAt; }
     public double confidence() { return confidence; }
+    public String language() { return language; }
 
     public boolean hasPrice() { return marketHigh > 0.0; }
 
