@@ -20,4 +20,14 @@ public class CardNumberParserTest {
     @Test public void ignoresUnrelatedSmallFractions() {
         assertTrue(CardNumberParser.parse("1/2 off today").isEmpty());
     }
+
+    @Test public void rejectsImplausibleOcrRatio() {
+        assertTrue(CardNumberParser.parse("noise 111/10 more noise").isEmpty());
+    }
+
+    @Test public void stillAllowsSecretRareAbovePrintedTotal() {
+        var c = CardNumberParser.parse("205/165").orElseThrow();
+        assertEquals("205", c.collectorNumber());
+        assertEquals(165, c.printedTotal());
+    }
 }
