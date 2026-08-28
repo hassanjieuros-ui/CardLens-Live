@@ -31,6 +31,7 @@ public final class TcgDexClient {
     private static final int MAX_VISUAL = 6;
     private static final int MAX_DETAILS = 5;
 
+    private final TcgDexNameClient nameClient = new TcgDexNameClient("ja");
     private final Map<String, JSONArray> briefCache =
             new LinkedHashMap<String, JSONArray>(32, .75f, true) {
                 @Override protected boolean removeEldestEntry(Map.Entry<String, JSONArray> eldest) {
@@ -46,6 +47,10 @@ public final class TcgDexClient {
 
     public MarketCard lookup(CardNumberParser.Candidate candidate, String ocrText,
                              VisualMatcher.LiveSignature liveSignature) throws Exception {
+        if (candidate != null && candidate.isNameCandidate()) {
+            return nameClient.lookup(candidate.nameHint(), ocrText, liveSignature);
+        }
+
         List<ScoredCard> candidates = loadBriefCandidates(candidate.collectorNumber(), ocrText);
         if (candidates.isEmpty()) return null;
 
