@@ -4,12 +4,11 @@ import android.graphics.Bitmap;
 import android.graphics.Color;
 
 /**
- * Cheap, allocation-light frame scoring used before OCR/visual matching.
+ * Cheap frame scoring used before OCR/visual matching.
  *
- * The score intentionally looks mostly at the center of the stream where the card usually sits.
- * It estimates sharpness from local luminance differences and applies penalties for severe glare
- * or crushed darkness. This lets CardLens skip obviously motion-blurred frames instead of wasting
- * ML Kit/CPU time on them.
+ * v0.8.1 evaluates both a broad center region and a tighter likely-card region, then keeps the
+ * better result. That prevents animated Whatnot UI/background areas from making a readable card
+ * look unusable. Thresholds are intentionally permissive; artwork matching is the final safety gate.
  */
 public final class FrameQuality {
     private FrameQuality() {}
@@ -19,16 +18,25 @@ public final class FrameQuality {
             return Result.bad();
         }
 
+        Result broad = analyzeRegion(bitmap, .10f, .08f, .90f, .88f);
+        Result card = analyzeRegion(bitmap, .22f, .02f, .78f, .78f);
+
+        // Prefer the tighter card-region read when it is clearer, but keep the broad region as a
+        // fallback for sellers holding cards slightly off center.
+        return card.quality() >= broad.quality() ? card : broad;
+    }
+
+    private static Result analyzeRegion(Bitmap bitmap, float leftPct, float topPct,
+                                        float rightPct, float bottomPct) {
         int width = bitmap.getWidth();
         int height = bitmap.getHeight();
+        int left = Math.round(width * leftPct);
+        int right = Math.round(width * rightPct);
+        int top = Math.round(height * topPct);
+        int bottom = Math.round(height * bottomPct);
 
-        int left = Math.round(width * .10f);
-        int right = Math.round(width * .90f);
-        int top = Math.round(height * .08f);
-        int bottom = Math.round(height * .88f);
-
-        int stepX = Math.max(2, (right - left) / 36);
-        int stepY = Math.max(2, (bottom - top) / 54);
+        int stepX = Math.max(2, (right - left) / 34);
+        int stepY = Math.max(2, (bottom - top) / 50);
 
         long edgeSum = 0;
         int edgeCount = 0;
@@ -47,8 +55,8 @@ public final class FrameQuality {
                 edgeCount += 2;
                 samples++;
 
-                if (c >= 245) bright++;
-                if (c <= 18) dark++;
+                if (c >= 247) bright++;
+                if (c <= 15) dark++;
             }
         }
 
@@ -58,12 +66,12 @@ public final class FrameQuality {
         double glare = bright / (double) samples;
         double darkness = dark / (double) samples;
 
-        // Tuned so a clearly readable stream frame scores high while strong motion blur falls under
-        // the OCR threshold. The exposure penalties are deliberately gentle because foil cards can
-        // contain bright highlights without actually being unusable.
-        double sharpness = clamp((normalizedEdge - .018) / .120);
-        double glarePenalty = 1.0 - Math.min(.72, glare * 1.45);
-        double darkPenalty = 1.0 - Math.min(.55, darkness * 1.10);
+        // 640-wide live video is softer than a still image. The old threshold was rejecting
+        // compressed but readable auction frames. Keep the blur gate cheap and permissive here;
+        // downstream multi-frame + artwork matching still rejects bad identities.
+        double sharpness = clamp((normalizedEdge - .010) / .105);
+        double glarePenalty = 1.0 - Math.min(.65, glare * 1.25);
+        double darkPenalty = 1.0 - Math.min(.50, darkness * .95);
         double quality = clamp(sharpness * glarePenalty * darkPenalty);
 
         return new Result(quality, sharpness, glare, darkness);
@@ -102,11 +110,11 @@ public final class FrameQuality {
         public double darkness() { return darkness; }
 
         public boolean worthOcr() {
-            return quality >= .15 && glare < .58;
+            return quality >= .08 && glare < .68;
         }
 
         public boolean strongFrame() {
-            return quality >= .28 && glare < .45;
+            return quality >= .18 && glare < .55;
         }
     }
 }
