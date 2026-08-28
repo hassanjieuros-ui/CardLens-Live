@@ -38,8 +38,14 @@ public final class PokemonTcgClient {
                 }
             };
 
+    private final TcgDexNameClient nameClient = new TcgDexNameClient("en");
+
     public MarketCard lookup(CardNumberParser.Candidate candidate, String ocrText,
                              VisualMatcher.LiveSignature liveSignature) throws Exception {
+        if (candidate != null && candidate.isNameCandidate()) {
+            return nameClient.lookup(candidate.nameHint(), ocrText, liveSignature);
+        }
+
         JSONArray data = fetchCandidates(candidate);
         if (data == null || data.length() == 0) return null;
 
