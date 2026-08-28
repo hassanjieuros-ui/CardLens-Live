@@ -50,18 +50,18 @@ public final class OverlayController {
     public void showScanning() {
         if (!canShow()) return;
         ensureCreated();
+        setCompact(true);
         title.setText("Scanning…");
-        subtitle.setText("Watching the auction");
-        price.setText("—");
-        priceCaption.setText("WAITING FOR CARD");
-        buyTarget.setText("");
-        status.setText("HYBRID • SUDDEN DEATH");
+        subtitle.setText("Watching for the clearest card frame");
+        priceCaption.setText("BEST-FRAME BUFFER ACTIVE");
+        status.setText("MOTION TOLERANT • SUDDEN DEATH");
         status.setTextColor(BLUE);
     }
 
     public void showCard(MarketCard card) {
         if (!canShow()) return;
         ensureCreated();
+        setCompact(false);
 
         title.setText(card.name());
         subtitle.setText(card.setName() + "  •  #" + card.number());
@@ -85,78 +85,94 @@ public final class OverlayController {
     public void showMessage(String message) {
         if (!canShow()) return;
         ensureCreated();
-
         if (message == null) message = "";
         String key = extractKey(message);
 
+        if (message.startsWith("MOTION BUFFERING")) {
+            setCompact(true);
+            title.setText("Tracking card");
+            subtitle.setText("Movement detected • saving the sharpest frame");
+            priceCaption.setText("SKIPPING BLURRED FRAMES");
+            status.setText("MOTION TOLERANCE");
+            status.setTextColor(BLUE);
+            return;
+        }
+
         if (message.startsWith("CANDIDATE")) {
+            setCompact(true);
             title.setText("Possible card");
-            subtitle.setText(key.isEmpty() ? "Confirming the read" : "#" + key + " • confirming");
-            price.setText("—");
-            priceCaption.setText("VERIFYING CARD");
-            buyTarget.setText("");
-            status.setText("QUICK CHECK");
+            subtitle.setText(key.isEmpty()
+                    ? "Combining nearby frames"
+                    : "#" + key + " • building a multi-frame read");
+            priceCaption.setText("COLLECTING CLEAR EVIDENCE");
+            status.setText("TRACKING MOTION");
             status.setTextColor(YELLOW);
             return;
         }
 
         if (message.startsWith("VISUAL MATCH") || message.startsWith("IDENTIFYING")) {
+            setCompact(true);
             title.setText("Matching artwork");
-            subtitle.setText(key.isEmpty() ? "Comparing the illustration" : "#" + key + " • artwork check");
-            price.setText("—");
-            priceCaption.setText("IDENTIFYING CARD");
-            buyTarget.setText("");
-            status.setText("ARTWORK VERIFY");
+            subtitle.setText(key.isEmpty()
+                    ? "Using the clearest recent frame"
+                    : "#" + key + " • comparing best frame");
+            priceCaption.setText("ILLUSTRATION + MULTI-FRAME TEXT");
+            status.setText("BEST FRAME");
             status.setTextColor(BLUE);
             return;
         }
 
         if (message.startsWith("AMBIGUOUS")) {
-            title.setText("Possible match");
-            subtitle.setText(key.isEmpty() ? "Artwork is not distinct enough yet" : "#" + key + " • visual match unclear");
-            price.setText("—");
+            setCompact(true);
+            title.setText("Collecting more frames");
+            subtitle.setText(key.isEmpty()
+                    ? "The artwork is not clear enough yet"
+                    : "#" + key + " • waiting for a sharper angle");
             priceCaption.setText("NO PRICE SHOWN");
-            buyTarget.setText("HOLD CARD STEADY");
             status.setText("LOW CONFIDENCE");
             status.setTextColor(YELLOW);
             return;
         }
 
-        if (message.contains("RATE LIMITED")) {
-            title.setText("Card data paused");
-            subtitle.setText("Too many card-data requests were reached");
-            price.setText("—");
-            priceCaption.setText("IDENTITY NOT CONFIRMED");
-            buyTarget.setText("SCANNER WILL RETRY SAFELY");
-            status.setText("RATE LIMIT");
-            status.setTextColor(RED);
+        if (message.startsWith("CARD DATA RATE LIMITED")) {
+            setCompact(true);
+            title.setText("Card data temporarily limited");
+            subtitle.setText("Scanner is cooling down its requests");
+            priceCaption.setText("LOCAL SCAN STILL ACTIVE");
+            status.setText("DATA BACKOFF");
+            status.setTextColor(YELLOW);
             return;
         }
 
-        if (message.contains("IDENTIFICATION RETRYING")) {
-            title.setText("Card not resolved");
-            subtitle.setText("Card-data connection is retrying");
-            price.setText("—");
-            priceCaption.setText("IDENTITY NOT CONFIRMED");
-            buyTarget.setText("KEEP CARD VISIBLE");
-            status.setText("RETRYING SAFELY");
+        if (message.contains("RETRYING")) {
+            setCompact(true);
+            title.setText("Identification retrying");
+            subtitle.setText("Keeping the best recent card frame");
+            priceCaption.setText("WAITING FOR CARD DATA");
+            status.setText("RETRYING");
             status.setTextColor(YELLOW);
             return;
         }
 
         if (message.contains("SCREEN SHARE")) {
+            setCompact(true);
             title.setText("Screen share unavailable");
             subtitle.setText("Restart CardLens and approve sharing");
-            price.setText("—");
             priceCaption.setText("SCANNER PAUSED");
-            buyTarget.setText("");
             status.setText("ACTION NEEDED");
             status.setTextColor(RED);
             return;
         }
 
+        setCompact(true);
         status.setText(message);
         status.setTextColor(SECONDARY);
+    }
+
+    private void setCompact(boolean compact) {
+        price.setVisibility(compact ? View.GONE : View.VISIBLE);
+        buyTarget.setVisibility(compact ? View.GONE : View.VISIBLE);
+        priceCaption.setVisibility(View.VISIBLE);
     }
 
     private String marketValueLabel(MarketCard card) {
@@ -189,8 +205,8 @@ public final class OverlayController {
         header.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView brand = label("CARDLENS", 10.5f, TEXT, true);
-        header.addView(brand, new LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        header.addView(brand, new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
         TextView live = label("● LIVE", 10, GREEN, true);
         live.setGravity(Gravity.CENTER);
@@ -204,26 +220,26 @@ public final class OverlayController {
         root.addView(title, matchWrap());
 
         subtitle = label("Watching the auction", 11.5f, SECONDARY, false);
-        subtitle.setPadding(0, dp(1), 0, 0);
+        subtitle.setPadding(0, dp(2), 0, 0);
         root.addView(subtitle, matchWrap());
 
         price = label("—", 31, TEXT, true);
         price.setPadding(0, dp(8), 0, 0);
         root.addView(price, matchWrap());
 
-        priceCaption = label("WAITING FOR CARD", 9.5f, MUTED, true);
-        priceCaption.setPadding(0, 0, 0, dp(6));
+        priceCaption = label("BEST-FRAME BUFFER ACTIVE", 9.5f, MUTED, true);
+        priceCaption.setPadding(0, dp(5), 0, dp(5));
         root.addView(priceCaption, matchWrap());
 
         buyTarget = label("", 15.5f, GREEN, true);
         root.addView(buyTarget, matchWrap());
 
-        status = label("HYBRID • SUDDEN DEATH", 9.5f, BLUE, true);
-        status.setPadding(0, dp(6), 0, 0);
+        status = label("MOTION TOLERANT • SUDDEN DEATH", 9.5f, BLUE, true);
+        status.setPadding(0, dp(5), 0, 0);
         root.addView(status, matchWrap());
 
         params = new WindowManager.LayoutParams(
-                dp(300),
+                dp(292),
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
@@ -231,10 +247,11 @@ public final class OverlayController {
                 PixelFormat.TRANSLUCENT);
         params.gravity = Gravity.TOP | Gravity.END;
         params.x = dp(10);
-        params.y = dp(95);
+        params.y = dp(82);
 
         root.setOnTouchListener(new DragTouchListener());
         windowManager.addView(root, params);
+        setCompact(true);
     }
 
     private TextView label(String value, float sp, int color, boolean bold) {
@@ -280,7 +297,8 @@ public final class OverlayController {
         private float downX;
         private float downY;
 
-        @Override public boolean onTouch(View v, MotionEvent event) {
+        @Override
+        public boolean onTouch(View v, MotionEvent event) {
             switch (event.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
                     startX = params.x;
