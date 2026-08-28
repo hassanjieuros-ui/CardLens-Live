@@ -10,8 +10,8 @@ android {
         applicationId 'com.cardlens.live'
         minSdk 26
         targetSdk 36
-        versionCode 8
-        versionName '0.7.1'
+        versionCode 9
+        versionName '0.8.0'
 
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
 
@@ -31,5 +31,6 @@ android {
 
 dependencies {
     implementation 'com.google.mlkit:text-recognition:16.0.1'
+    implementation 'com.google.mlkit:text-recognition-japanese:16.0.1'
     testImplementation 'junit:junit:4.13.2'
 }
