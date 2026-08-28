@@ -127,6 +127,16 @@ public final class OverlayController {
             return;
         }
 
+        if (message.startsWith("FALSE CANDIDATE DROPPED")) {
+            setCompact(true);
+            title.setText("Scanning…");
+            subtitle.setText("Bad read ignored • looking again");
+            priceCaption.setText("FALSE MATCH CLEARED");
+            status.setText("READY");
+            status.setTextColor(BLUE);
+            return;
+        }
+
         if (message.startsWith("CARD DATA RATE LIMITED")) {
             setCompact(true);
             title.setText("Card data temporarily limited");
