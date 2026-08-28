@@ -493,9 +493,6 @@ public class CaptureService extends Service {
                 } catch (Exception e) {
                     firstError = e;
                 }
-                // A Japanese card can still have a perfectly readable Latin collector number.
-                // If the English catalog/artwork does not fit, try the Japanese catalog before
-                // declaring the candidate false.
                 if (card == null) {
                     try {
                         card = japaneseClient.lookup(candidate, ocrText, visualSignature);
@@ -523,6 +520,7 @@ public class CaptureService extends Service {
                 return;
             }
 
+            final MarketCard resolvedCard = card;
             ambiguousAttempts.remove(key);
             blockedCandidates.remove(key);
             if (key.equals(activeKey)
@@ -530,7 +528,7 @@ public class CaptureService extends Service {
                 shownKey = key;
                 lastConfirmedAt = SystemClock.elapsedRealtime();
                 bestFrames.clear();
-                main.post(() -> overlay.showCard(card));
+                main.post(() -> overlay.showCard(resolvedCard));
             }
         } catch (Exception e) {
             String message = e.getMessage() == null ? "" : e.getMessage().toLowerCase();
