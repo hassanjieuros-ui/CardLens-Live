@@ -68,10 +68,12 @@ public class CaptureService extends Service {
     private static final long ACTIVE_EVIDENCE_TTL_MS = 2200;
     private static final long LOOKUP_DEDUP_MS = 5000;
     private static final long AMBIGUOUS_RETRY_MS = 700;
+    private static final long FALSE_CANDIDATE_BLOCK_MS = 2200;
     private static final long NETWORK_BACKOFF_MS = 3500;
     private static final long RATE_LIMIT_BACKOFF_MS = 60000;
     private static final int CAPTURE_MAX_WIDTH = 640;
     private static final int MAX_PARALLEL_LOOKUPS = 1;
+    private static final int MAX_AMBIGUOUS_ATTEMPTS = 2;
     private static final int WIDE_SCAN_EVERY = 8;
 
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -80,6 +82,8 @@ public class CaptureService extends Service {
     private final ExecutorService network = Executors.newSingleThreadExecutor();
     private final PokemonTcgClient client = new PokemonTcgClient();
     private final Map<String, Long> lookupStartedAt = new ConcurrentHashMap<>();
+    private final Map<String, Integer> ambiguousAttempts = new ConcurrentHashMap<>();
+    private final Map<String, Long> blockedCandidates = new ConcurrentHashMap<>();
     private final BestFrameBuffer bestFrames = new BestFrameBuffer();
     private final EvidenceWindow evidence = new EvidenceWindow();
 
@@ -272,7 +276,10 @@ public class CaptureService extends Service {
 
         float leftPct = wideFallback ? 0.00f : 0.06f;
         float rightPct = wideFallback ? 1.00f : 0.94f;
-        float topPct = wideFallback ? 0.08f : 0.22f;
+        // The default CardLens overlay occupies the upper portion of the stream. Keep normal OCR
+        // below it so the scanner cannot read its own status text; wide fallback still samples the
+        // upper card/name area occasionally without showing raw collector fractions in the overlay.
+        float topPct = wideFallback ? 0.10f : 0.28f;
         float bottomPct = wideFallback ? 0.88f : 0.86f;
 
         int left = Math.max(0, Math.round(width * leftPct));
@@ -308,6 +315,10 @@ public class CaptureService extends Service {
     private void processOcrText(String text, Bitmap currentFrame,
                                 FrameQuality.Result quality, long frameAt) {
         Optional<CardNumberParser.Candidate> parsed = CardNumberParser.parse(text);
+        if (parsed.isPresent() && isCandidateBlocked(parsed.get().key(), frameAt)) {
+            parsed = Optional.empty();
+        }
+
         String parsedKey = parsed.isPresent() ? parsed.get().key() : "";
         evidence.record(parsedKey, text, quality.quality(), frameAt);
 
@@ -354,6 +365,35 @@ public class CaptureService extends Service {
         maybeResolveActive(frameAt);
     }
 
+    private boolean isCandidateBlocked(String key, long now) {
+        if (key == null || key.isEmpty()) return false;
+        Long until = blockedCandidates.get(key);
+        if (until == null) return false;
+        if (now >= until) {
+            blockedCandidates.remove(key);
+            return false;
+        }
+        return true;
+    }
+
+    private void dropFalseCandidate(String key) {
+        long now = SystemClock.elapsedRealtime();
+        blockedCandidates.put(key, now + FALSE_CANDIDATE_BLOCK_MS);
+        ambiguousAttempts.remove(key);
+        lookupStartedAt.remove(key);
+
+        if (key.equals(activeKey)) {
+            activeCandidate = null;
+            activeKey = "";
+            activeLastSeenAt = 0;
+            burstUntil = 0;
+            evidence.clear();
+            bestFrames.clear();
+        }
+
+        main.post(() -> overlay.showMessage("FALSE CANDIDATE DROPPED"));
+    }
+
     private void startShortBurst(long now) {
         if (now < nextBurstAllowedAt) return;
         burstUntil = now + BURST_DURATION_MS;
@@ -364,6 +404,7 @@ public class CaptureService extends Service {
         CardNumberParser.Candidate candidate = activeCandidate;
         String key = activeKey;
         if (candidate == null || key.isEmpty() || key.equals(shownKey)) return false;
+        if (isCandidateBlocked(key, now)) return false;
         if (evidence.votes(key, now) < 2) return false;
         if (now < lookupBackoffUntil) return false;
         if (lookupsInFlight.get() >= MAX_PARALLEL_LOOKUPS) return false;
@@ -389,9 +430,13 @@ public class CaptureService extends Service {
     }
 
     private void trimLookupHistory(long now) {
-        if (lookupStartedAt.size() < 64) return;
-        for (Map.Entry<String, Long> entry : lookupStartedAt.entrySet()) {
-            if (now - entry.getValue() > 30000) lookupStartedAt.remove(entry.getKey());
+        if (lookupStartedAt.size() >= 64) {
+            for (Map.Entry<String, Long> entry : lookupStartedAt.entrySet()) {
+                if (now - entry.getValue() > 30000) lookupStartedAt.remove(entry.getKey());
+            }
+        }
+        for (Map.Entry<String, Long> entry : blockedCandidates.entrySet()) {
+            if (now >= entry.getValue()) blockedCandidates.remove(entry.getKey());
         }
     }
 
@@ -404,8 +449,14 @@ public class CaptureService extends Service {
             Log.d(TAG, "Motion-tolerant lookup " + key + " " + elapsed + "ms");
 
             if (card == null) {
-                // Allow another clear-frame attempt soon instead of freezing the candidate for the
-                // full dedup period. A host may have tilted or shaken the first retained frame.
+                int attempts = ambiguousAttempts.merge(key, 1, Integer::sum);
+                if (attempts >= MAX_AMBIGUOUS_ATTEMPTS) {
+                    Log.i(TAG, "Dropping repeatedly unsupported candidate " + key);
+                    dropFalseCandidate(key);
+                    return;
+                }
+
+                // Allow one newer clear-frame attempt before declaring the OCR candidate false.
                 lookupStartedAt.put(key,
                         SystemClock.elapsedRealtime() - LOOKUP_DEDUP_MS + AMBIGUOUS_RETRY_MS);
                 if (key.equals(activeKey)) {
@@ -415,6 +466,8 @@ public class CaptureService extends Service {
                 return;
             }
 
+            ambiguousAttempts.remove(key);
+            blockedCandidates.remove(key);
             if (key.equals(activeKey)
                     || SystemClock.elapsedRealtime() - activeLastSeenAt <= ACTIVE_EVIDENCE_TTL_MS + 1600) {
                 shownKey = key;
@@ -470,6 +523,8 @@ public class CaptureService extends Service {
     @Override public void onDestroy() {
         bestFrames.clear();
         evidence.clear();
+        ambiguousAttempts.clear();
+        blockedCandidates.clear();
         if (imageReader != null) {
             imageReader.setOnImageAvailableListener(null, null);
             imageReader.close();
