@@ -2,6 +2,7 @@
 
 package com.cardlens.scan
 
+import android.content.ClipData
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -31,6 +32,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
@@ -58,6 +61,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -77,6 +81,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.net.URL
@@ -439,7 +444,10 @@ fun SettingsDialog(vm: AppViewModel, onClose: () -> Unit) {
         onDismissRequest = onClose,
         title = { Text("Settings") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
                 OutlinedTextField(
                     key, { key = it }, label = { Text("Anthropic API key") }, singleLine = true,
                     visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(),
@@ -455,6 +463,7 @@ fun SettingsDialog(vm: AppViewModel, onClose: () -> Unit) {
                     modifier = Modifier.fillMaxWidth(),
                 )
                 TextButton(onClick = { vm.clearPriceCache() }) { Text("Refresh prices now") }
+                ScanLogSection(vm)
                 Text(
                     "Prices are TCGplayer market prices, updated daily. Condition discounts: LP 85%, MP 70%, HP 50%, DMG 30% of market.",
                     fontSize = 12.sp,
@@ -492,6 +501,80 @@ fun RemoteImage(url: String, modifier: Modifier) {
         val b = bmp
         if (b != null) {
             Image(b.asImageBitmap(), contentDescription = null, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
+        }
+    }
+}
+
+@Composable
+fun ScanLogSection(vm: AppViewModel) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var stats by remember { mutableStateOf(vm.scanStats()) }
+    var armed by remember { mutableStateOf(false) }
+    var busy by remember { mutableStateOf(false) }
+
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant).padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text("Scan accuracy", fontWeight = FontWeight.SemiBold)
+        if (stats.counted == 0) {
+            Text("No scans logged yet. Every scan is saved with what you picked or fixed.", fontSize = 12.sp)
+        } else {
+            Text("Last ${stats.counted} scans", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
+            Text("Right card first try: ${stats.firstTry}", fontSize = 13.sp, color = Mint)
+            Text("Right card lower in list: ${stats.inList}", fontSize = 13.sp)
+            Text("Needed a fix: ${stats.fixed}", fontSize = 13.sp)
+            Text("Missed (manual, discarded, error): ${stats.missed}", fontSize = 13.sp, color = MaterialTheme.colorScheme.error)
+            Text(
+                String.format(java.util.Locale.US, "Average scan time: %.1fs", stats.avgSeconds),
+                fontSize = 13.sp, fontFamily = FontFamily.Monospace,
+            )
+            Text("${stats.totalLogged} scans saved in total", fontSize = 12.sp)
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            TextButton(
+                enabled = !busy && stats.totalLogged > 0,
+                onClick = {
+                    busy = true
+                    scope.launch {
+                        try {
+                            val zip = withContext(Dispatchers.IO) { vm.exportScans() }
+                            val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", zip)
+                            val send = Intent(Intent.ACTION_SEND).apply {
+                                type = "application/zip"
+                                putExtra(Intent.EXTRA_STREAM, uri)
+                                putExtra(Intent.EXTRA_SUBJECT, zip.name)
+                                clipData = ClipData.newRawUri(zip.name, uri)
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            context.startActivity(Intent.createChooser(send, "Share scan log"))
+                        } catch (e: Exception) {
+                            vm.toast = "Export failed: ${e.message}"
+                        } finally {
+                            busy = false
+                        }
+                    }
+                },
+            ) { Text(if (busy) "Preparing…" else "Export log") }
+            TextButton(
+                enabled = stats.totalLogged > 0,
+                onClick = {
+                    if (armed) {
+                        vm.clearScans()
+                        stats = LogStats(0, 0, 0, 0, 0, 0.0, 0)
+                        armed = false
+                    } else {
+                        armed = true
+                    }
+                },
+            ) {
+                Text(
+                    if (armed) "Tap again to delete" else "Clear log",
+                    color = if (armed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                )
+            }
         }
     }
 }

@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
+import android.util.Base64
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -44,6 +45,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val prefs = app.getSharedPreferences("cardlens", Context.MODE_PRIVATE)
     private val cacheDir = File(app.cacheDir, "tcgcsv")
     private val prices = TcgPrices(DiskCache(cacheDir))
+    private val scanLog = ScanLog(File(app.filesDir, "scans"))
+    private var pending: PendingScan? = null
 
     var apiKey by mutableStateOf(prefs.getString("apiKey", "") ?: "")
         private set
@@ -89,21 +92,43 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun onPhoto(uri: Uri) {
         val ctx = getApplication<Application>()
+        // A new scan replaces one the user never chose from.
+        pending?.let { logFinish(it, "abandoned", null, null) }
+        pending = null
+        val scanId = scanLog.newScanId()
+        val started = System.currentTimeMillis()
+        val usedModel = model
         viewModelScope.launch {
+            var stage = "photo"
             try {
                 phase = Phase.Working("Reading photo…")
                 val (bmp, b64) = withContext(Dispatchers.IO) { ImageUtil.load(ctx, uri) }
+                withContext(Dispatchers.IO) {
+                    runCatching { scanLog.savePhoto(scanId, Base64.decode(b64, Base64.NO_WRAP)) }
+                }
+                stage = "identify"
                 phase = Phase.Working("Identifying card…")
-                val id = withContext(Dispatchers.IO) { Identifier.identify(apiKey, model, b64) }
+                val t0 = System.currentTimeMillis()
+                val id = withContext(Dispatchers.IO) { Identifier.identify(apiKey, usedModel, b64) }
+                val identifyMs = System.currentTimeMillis() - t0
                 if (id.game == "other") {
+                    pending = PendingScan(scanId, started, usedModel, identifyMs, 0, id, emptyList())
                     phase = Phase.Result(bmp, id, emptyList())
                     return@launch
                 }
+                stage = "price"
                 phase = Phase.Working("Pulling TCGplayer prices…")
+                val t1 = System.currentTimeMillis()
                 val found = withContext(Dispatchers.IO) { prices.find(id) }
+                val priceMs = System.currentTimeMillis() - t1
+                pending = PendingScan(scanId, started, usedModel, identifyMs, priceMs, id, found)
                 phase = Phase.Result(bmp, id, found)
             } catch (e: Exception) {
-                phase = Phase.Failed(e.message ?: "Something went wrong. Try again.")
+                val msg = e.message ?: "Something went wrong. Try again."
+                withContext(Dispatchers.IO) {
+                    runCatching { scanLog.error(scanId, started, usedModel, stage, msg) }
+                }
+                phase = Phase.Failed(msg)
             }
         }
     }
@@ -116,21 +141,49 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 phase = Phase.Working("Searching again…")
                 val found = withContext(Dispatchers.IO) { prices.find(id, setName, number) }
+                pending?.let {
+                    it.researched = true
+                    it.corrected = id
+                    it.printings = found
+                }
                 phase = Phase.Result(current.photo, id, found)
             } catch (e: Exception) {
-                phase = Phase.Failed(e.message ?: "Search failed.")
+                toast = e.message ?: "Search failed. Check your connection."
+                phase = current
             }
         }
     }
 
     fun add(p: Printing) {
+        pending?.let { logFinish(it, "added", p, null) }
+        pending = null
         val m = p.market ?: p.low ?: 0.0
         val detail = listOf(p.groupName, p.number, p.subType).filter { it.isNotBlank() }.joinToString(" · ")
         addItem(LotItem(p.name, detail, condition, m))
     }
 
     fun addManual(name: String, market: Double) {
+        pending?.let { logFinish(it, "manual", null, market) }
+        pending = null
         addItem(LotItem(name.ifBlank { "Manual card" }, "Manual price", condition, market))
+    }
+
+    private fun logFinish(p: PendingScan, outcome: String, chosen: Printing?, manualPrice: Double?) {
+        val cond = condition
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { scanLog.finish(p, outcome, chosen, manualPrice, cond) }
+        }
+    }
+
+    fun scanStats(): LogStats = runCatching { scanLog.stats(30) }
+        .getOrDefault(LogStats(0, 0, 0, 0, 0, 0.0, 0))
+
+    fun exportScans(): File = scanLog.exportZip(File(getApplication<Application>().cacheDir, "exports"))
+
+    fun clearScans() {
+        pending = null
+        viewModelScope.launch(Dispatchers.IO) { runCatching { scanLog.clear() } }
+        toast = "Scan log cleared"
     }
 
     private fun addItem(item: LotItem) {
@@ -151,6 +204,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun dismiss() {
+        if (phase is Phase.Result) {
+            pending?.let { logFinish(it, "discarded", null, null) }
+            pending = null
+        }
         phase = Phase.Idle
     }
 
